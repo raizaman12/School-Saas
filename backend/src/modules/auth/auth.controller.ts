@@ -46,23 +46,30 @@ function setRefreshCookie(res: Response, token: string, expiresAt: Date) {
   // http://*.localhost without real TLS, because *.localhost is spec'd as
   // a "potentially trustworthy origin" regardless of scheme — so this
   // doesn't require HTTPS in local dev, only in a real production host.
-  const crossHost = Boolean(env.COOKIE_DOMAIN);
+  // See COOKIE_SAMESITE_NONE's doc comment in config/env.ts — it's a
+  // separate knob from COOKIE_DOMAIN because the two solve different
+  // topologies (a shared parent domain vs. two entirely unrelated
+  // domains, e.g. this project's own Vercel-frontend + Render-API
+  // free-tier demo deployment, where a Domain attribute can't help at
+  // all — a browser will only accept a Domain that is the setting host's
+  // own domain or a parent of it).
+  const crossHost = Boolean(env.COOKIE_DOMAIN) || env.COOKIE_SAMESITE_NONE;
   res.cookie(REFRESH_COOKIE, token, {
     httpOnly: true,
     secure: crossHost || env.NODE_ENV === 'production',
     sameSite: crossHost ? 'none' : 'lax',
     expires: expiresAt,
     // Path is deliberately "/" rather than "/api/auth": the cookie is
-    // httpOnly (never readable by JS regardless of path) and the Day 11
-    // frontend's proxy (middleware) needs to detect session *presence* on
-    // requests to routes like /dashboard to avoid a flash of protected UI
-    // before the client-side auth check runs. A path scoped to /api/auth
-    // would never be sent to those routes at all.
+    // httpOnly (never readable by JS regardless of path), and while it's
+    // no longer what the frontend's proxy (middleware) reads for its own
+    // session-presence check (see frontend/src/proxy.ts + lib/api.ts's
+    // session-hint cookie — this one is invisible cross-domain in the
+    // split free-tier topology, so the middleware can't rely on it there
+    // either), a full path keeps this cookie behaving like an ordinary
+    // site-wide session cookie rather than one scoped to a single route.
     path: '/',
-    // See COOKIE_DOMAIN's doc comment in config/env.ts — without this the
-    // cookie is invisible to the frontend's own host (api.* vs <slug>.*
-    // are different hosts) and the middleware's session check always
-    // fails. undefined falls back to express's own host-only default.
+    // See COOKIE_DOMAIN's doc comment in config/env.ts. undefined falls
+    // back to express's own host-only default.
     domain: env.COOKIE_DOMAIN,
   });
 }

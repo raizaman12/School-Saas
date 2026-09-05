@@ -2,14 +2,25 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
 /**
- * First line of defense only — checks for the *presence* of the httpOnly
- * refresh cookie (readable server-side even though client JS can't touch
- * it) to bounce obviously-logged-out visitors away from the dashboard
- * before any page code runs. The real authorization boundary is the API:
- * every request still carries a bearer access token that the backend
- * verifies and RBAC-checks independently, so this middleware only ever
- * improves UX (fewer flashes of protected UI) — it is never the sole
- * guard.
+ * First line of defense only — checks for the *presence* of a lightweight
+ * "session hint" cookie (see lib/api.ts's SESSION_HINT_COOKIE) to bounce
+ * obviously-logged-out visitors away from the dashboard before any page
+ * code runs. The real authorization boundary is the API: every request
+ * still carries a bearer access token that the backend verifies and
+ * RBAC-checks independently, so this middleware only ever improves UX
+ * (fewer flashes of protected UI) — it is never the sole guard.
+ *
+ * This deliberately does NOT check the backend's own httpOnly refresh
+ * cookie. That cookie is scoped to the API's own host, which this
+ * middleware (running against requests to the FRONTEND's host) can never
+ * see whenever the two are on different domains — including this
+ * project's own free-tier demo deployment (a Vercel frontend + a Render
+ * API on two entirely unrelated domains, where no cookie Domain
+ * configuration could bridge them). The session-hint cookie sidesteps
+ * that by being set directly on the frontend's own domain, by the
+ * frontend's own client-side code, so this check works identically
+ * whether frontend and backend share a host, share a parent domain, or
+ * sit on two unrelated domains.
  *
  * IMPORTANT: /login and /signup are deliberately NOT guest-only-gated
  * here. An earlier version silently redirected an already-authenticated
@@ -32,7 +43,7 @@ import type { NextRequest } from "next/server";
  */
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
-  const hasSession = request.cookies.has("refreshToken");
+  const hasSession = request.cookies.has("school_saas_has_session");
 
   const isDashboardPath = pathname.startsWith("/dashboard") || pathname.startsWith("/portal");
 

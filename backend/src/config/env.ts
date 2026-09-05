@@ -53,6 +53,27 @@ const envSchema = z.object({
     .optional()
     .transform((v) => (v ? v : undefined)),
 
+  // Forces the refresh-token cookie to SameSite=None (+ Secure) even when
+  // COOKIE_DOMAIN is unset. COOKIE_DOMAIN's own "shared Domain" trick only
+  // works when the frontend and API sit on the same registrable domain
+  // (e.g. api.yourschoolsaas.com + <slug>.yourschoolsaas.com) — a browser
+  // will reject a Domain attribute that isn't the setting host's own
+  // domain or a parent of it, so it CANNOT be used to share a cookie
+  // between two unrelated domains (e.g. a Vercel-hosted frontend and a
+  // Render-hosted API, as in this project's own free-tier demo
+  // deployment). That split-domain topology still needs SameSite=None for
+  // the browser to send the cookie back cross-site on POST
+  // /api/auth/refresh (credentials: "include") at all — hence this
+  // separate, independent knob. Does not set a Domain attribute itself
+  // (stays a host-only cookie on the API's own host), so it's safe to
+  // enable regardless of whether COOKIE_DOMAIN is also set. Optional
+  // because same-origin dev and same-registrable-domain production
+  // deployments don't need it.
+  COOKIE_SAMESITE_NONE: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+
   // Local filesystem directory for generated artifacts that outlive a
   // single request (bulk report-card zip files). A single-VPS pm2
   // deployment (see docs/DEPLOYMENT.md) has one persistent disk, so this

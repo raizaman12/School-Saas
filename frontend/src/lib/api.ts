@@ -55,6 +55,47 @@ export function getAccessToken() {
 // in anywhere behaves exactly as before.
 const REFRESH_TOKEN_STORAGE_KEY = "school_saas_tab_refresh_token";
 
+// --- Session-hint cookie (for proxy.ts's middleware only) ---------------
+//
+// The backend's own refresh-token cookie is httpOnly and scoped to the
+// API's host. That's invisible to requests made to the FRONTEND's host
+// whenever the two are on different domains — true even with
+// COOKIE_DOMAIN set (that only shares a cookie between hosts on the same
+// registrable domain, e.g. api.yourschoolsaas.com + <slug>.yourschoolsaas.com)
+// and unavoidably true when they're on two entirely unrelated domains,
+// e.g. this project's own free-tier demo (a Vercel frontend + a Render
+// API) — a browser will only accept a Domain attribute that is the
+// setting host's own domain or a parent of it, so there is no Domain
+// value that could ever make the API's cookie visible on the frontend's
+// host in that topology. proxy.ts's middleware runs server-side against
+// whatever the frontend's own host received, so it can never see a cookie
+// scoped to a different host no matter how the backend configures it.
+//
+// This cookie sidesteps that entirely by being set on the frontend's OWN
+// domain, by the frontend's own client-side code, right alongside every
+// place this file already tracks "is there a session" (see
+// setStoredRefreshToken below). It carries no token and isn't httpOnly —
+// its only job is a presence check so the middleware can gate /dashboard
+// and /portal without a flash of protected UI; the real authorization
+// boundary stays the API's own bearer-token check on every request, same
+// as before. Safe (and correct) to keep setting even in a same-domain or
+// shared-parent-domain deployment — it's simply redundant with the
+// backend cookie there, not in conflict with it.
+const SESSION_HINT_COOKIE = "school_saas_has_session";
+
+function setSessionHintCookie(present: boolean) {
+  if (typeof document === "undefined") return;
+  try {
+    document.cookie = present
+      ? `${SESSION_HINT_COOKIE}=1; path=/; max-age=2592000; samesite=lax`
+      : `${SESSION_HINT_COOKIE}=; path=/; max-age=0`;
+  } catch {
+    // Same private-browsing/storage-blocked fallback as sessionStorage
+    // below — worst case, the middleware treats this tab as logged out
+    // and the client-side session (accessToken in memory) still works.
+  }
+}
+
 function setStoredRefreshToken(token: string | null) {
   if (typeof window === "undefined") return;
   try {
@@ -65,6 +106,7 @@ function setStoredRefreshToken(token: string | null) {
     // tab just falls back to the shared cookie in that case, same as
     // before this feature existed.
   }
+  setSessionHintCookie(Boolean(token));
 }
 
 function getStoredRefreshToken(): string | null {

@@ -4,7 +4,11 @@ import { proxy } from "./proxy";
 
 function requestFor(path: string, { withRefreshCookie = false }: { withRefreshCookie?: boolean } = {}) {
   const req = new NextRequest(new URL(path, "http://localhost:3000"));
-  if (withRefreshCookie) req.cookies.set("refreshToken", "fake-token-value");
+  // "withRefreshCookie" names the test-facing concept (a signed-in
+  // visitor); it now sets the frontend's own session-hint cookie rather
+  // than the backend's httpOnly refresh cookie — see proxy.ts's doc
+  // comment for why the middleware reads that one instead.
+  if (withRefreshCookie) req.cookies.set("school_saas_has_session", "1");
   return req;
 }
 
