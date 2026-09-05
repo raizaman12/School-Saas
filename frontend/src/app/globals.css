@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8fafc;
+  --foreground: #0f172a;
+}
+
+@theme {
+  --color-primary-50: #eff6ff;
+  --color-primary-100: #dbeafe;
+  --color-primary-200: #bfdbfe;
+  --color-primary-300: #93c5fd;
+  --color-primary-400: #60a5fa;
+  --color-primary-500: #3b82f6;
+  --color-primary-600: #2563eb;
+  --color-primary-700: #1d4ed8;
+  --color-primary-800: #1e40af;
+  --color-primary-900: #1e3a8a;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-urdu: var(--font-noto-nastaliq-urdu);
+
+  /*
+   * Custom type scale for headings, named by role rather than raw size so
+   * every page picks a heading deliberately instead of guessing at
+   * text-lg/xl/2xl from memory (which is how dashboard pages, auth pages,
+   * and the landing page each drifted to a different, undocumented size).
+   * Sizes match what was already in use, so adopting this introduces no
+   * visual change on its own — only the ability to reuse a name.
+   */
+  --text-section-title: 1rem; /* card/section sub-headings, e.g. CardTitle */
+  --text-section-title--line-height: 1.5rem;
+  --text-page-title: 1.125rem; /* dashboard & portal page <h1> */
+  --text-page-title--line-height: 1.75rem;
+  --text-auth-title: 1.25rem; /* login/signup/error/not-found <h1> */
+  --text-auth-title--line-height: 1.75rem;
+  --text-brand-title: 1.5rem; /* public landing-page brand headline */
+  --text-brand-title--line-height: 2rem;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}
+
+/*
+ * Bilingual-readiness: any Urdu-script text (e.g. a student/guardian name
+ * entered in Urdu) should render with a proper Nastaliq font and flip to
+ * RTL locally, without the surrounding (English) UI chrome changing
+ * direction. Apply this class to the specific text node, not the page.
+ */
+.text-urdu {
+  font-family: var(--font-urdu), serif;
+  direction: rtl;
+  unicode-bidi: isolate;
+}
+
+@layer utilities {
+  .focus-ring {
+    @apply outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2 focus-visible:ring-offset-white;
+  }
+}

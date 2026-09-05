@@ -1,0 +1,2306 @@
+// School Management SaaS — Day 1 schema
+// Multi-tenancy model: shared database, every tenant-scoped table carries
+// `tenantId`, enforced in depth by Postgres Row-Level Security policies
+// (see prisma/migrations/<ts>_rls_setup/migration.sql). Prisma/app-level
+// filtering is the first line of defense; RLS is the second (defense in depth).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Platform-level: the tenant itself (a school / campus group)
+// ────────────────────────────────────────────────────────────────
+
+enum TenantStatus {
+  TRIAL
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+}
+
+enum TenantPlan {
+  TRIAL
+  BASIC
+  STANDARD
+  PREMIUM
+}
+
+model Tenant {
+  id     String       @id @default(uuid()) @db.Uuid
+  name   String
+  // subdomain / slug used for tenant resolution (e.g. citymodelschool.ourapp.com)
+  slug   String       @unique
+  status TenantStatus @default(TRIAL)
+  plan   TenantPlan   @default(TRIAL)
+
+  // Multi-branch schools: set only when this tenant is one branch of a
+  // SchoolGroup (see model below) — a fully independent Tenant in every
+  // other respect (own admin, own everything). NULL for an ordinary
+  // single-school tenant, which is the overwhelming majority and needs
+  // zero changes to keep working exactly as before. branchName is this
+  // branch's own label (e.g. "DHA Campus"); the branch's city reuses the
+  // existing `city` column below rather than a new one.
+  schoolGroupId String?      @db.Uuid
+  schoolGroup   SchoolGroup? @relation(fields: [schoolGroupId], references: [id], onDelete: SetNull)
+  branchName    String?
+
+  contactEmail String
+  contactPhone String?
+  address      String?
+  city         String?
+  timezone     String  @default("Asia/Karachi")
+
+  // Short, human-recognizable prefix (e.g. "EDU" for "Educator School")
+  // used to brand this tenant's auto-generated student/staff IDs, so two
+  // schools on the platform don't mint identical-looking codes. Derived
+  // automatically at signup (see utils/tenantCode.ts) — "" for tenants
+  // created before this field existed, in which case ID generation falls
+  // back to deriving it from `name` on the fly rather than needing a
+  // backfill migration.
+  code String @default("")
+
+  trialEndsAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // Atomically incremented to mint unique, human-readable student
+  // admission codes without a race condition (see students.service.ts).
+  nextStudentSeq  Int @default(1)
+  // Same pattern for invoice numbers (see fees/invoices.ts).
+  nextInvoiceSeq  Int @default(1)
+  // Same pattern for employee codes (see staff/staff.ts).
+  nextEmployeeSeq Int @default(1)
+  // Same pattern for transfer-certificate numbers (see sis/transferCertificates.ts).
+  nextTcSeq       Int @default(1)
+
+  // School branding (logo/letterhead) for PDF documents — report cards,
+  // fee vouchers. Optional: documents fall back to a plain text header
+  // when unset.
+  logoUrl String?
+
+  // Chosen accent-color theme for this school's dashboard/portal (e.g.
+  // "navy-blue", "bottle-green") — picked at signup and changeable later
+  // by the school admin. Must match one of the ids in
+  // config/themePresets.ts (validated at the application layer, not by a
+  // DB constraint, so adding a new preset never needs a migration).
+  themeId String @default("navy-blue")
+
+  // Days of the week with no classes, as JS/ISO day-of-week numbers
+  // (0=Sunday .. 6=Saturday) — Pakistani schools default to Sunday only,
+  // but some also close Saturday. Used alongside `Holiday` rows (one-off
+  // dates like Eid or a multi-day break) to compute whether a given date
+  // is a non-working day for attendance-marking and the parent/student
+  // portal's "No class today" state — see attendance/holidays.ts.
+  weeklyOffDays Int[] @default([0])
+
+  users               User[]
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  auditLogs           AuditLog[]
+
+  academicYears        AcademicYear[]
+  schoolClasses        SchoolClass[]
+  sections             Section[]
+  students             Student[]
+  guardians            Guardian[]
+  studentGuardians     StudentGuardian[]
+  enrollments          Enrollment[]
+  transferCertificates TransferCertificate[]
+
+  subjects          Subject[]
+  sectionSubjects   SectionSubject[]
+  timetableSlots    TimetableSlot[]
+  attendanceRecords AttendanceRecord[]
+  holidays          Holiday[]
+
+  exams               Exam[]
+  examSubjects        ExamSubject[]
+  marks               Mark[]
+  gradingBands        GradingBand[]
+  reportCardBatchJobs ReportCardBatchJob[]
+  classTests          ClassTest[]
+  classTestMarks      ClassTestMark[]
+
+  feeCategories     FeeCategory[]
+  feeStructureItems FeeStructureItem[]
+  invoices          Invoice[]
+  invoiceLineItems  InvoiceLineItem[]
+  payments          Payment[]
+  lateFeePolicy     LateFeePolicy?
+
+  staffProfiles  StaffProfile[]
+  payrollRecords PayrollRecord[]
+
+  notifications        Notification[]
+  homework             Homework[]
+  courseMaterials      CourseMaterial[]
+  leaveRequests        LeaveRequest[]
+  studentLeaveRequests StudentLeaveRequest[]
+  notices              Notice[]
+  noticeRecipients     NoticeRecipient[]
+  disciplineRecords    DisciplineRecord[]
+  supportNeeds         SupportNeed[]
+  supportNeedReviews   SupportNeedReview[]
+  healthProfiles       StudentHealthProfile[]
+  healthLogEntries     HealthLogEntry[]
+  customFieldDefinitions   CustomFieldDefinition[]
+  studentCustomFieldValues StudentCustomFieldValue[]
+  studentElectiveEnrollments StudentElectiveEnrollment[]
+
+  examPaperAccessGrants  ExamPaperAccessGrant[]
+  questionBankQuestions  QuestionBankQuestion[]
+  generatedExamPapers    GeneratedExamPaper[]
+  generatedExamQuestions GeneratedExamQuestion[]
+
+  @@index([schoolGroupId])
+  @@map("tenants")
+}
+
+// A shared, publicly-known login URL for a school that runs multiple
+// physical branches. Deliberately minimal and used PURELY for
+// pre-authentication discovery at signup/login time — every branch is a
+// fully ordinary, independent Tenant (own admin, own data, own everything
+// — see Tenant.schoolGroupId/branchName above). This model itself is never
+// tenant-scoped (much like Tenant itself — a row here isn't owned by any
+// one tenant, it groups several), so it carries no tenantId and needs its
+// own RLS policies (open SELECT/INSERT, no UPDATE/DELETE for the app role
+// — see the migration) mirroring `tenants`' own documented rationale:
+// tenant resolution must happen pre-authentication, before any
+// app.tenant_id context exists.
+model SchoolGroup {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+
+  branches Tenant[]
+
+  @@map("school_groups")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Users & RBAC
+// ────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  SUPER_ADMIN // platform staff — tenantId is NULL
+  SCHOOL_ADMIN // owns a tenant, full access within it
+  PRINCIPAL // academic oversight/approval — below School Admin, above Teacher
+  TEACHER
+  ACCOUNTANT
+  FRONT_DESK
+  PARENT
+  STUDENT
+}
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  DISABLED
+}
+
+model User {
+  id       String  @id @default(uuid()) @db.Uuid
+  // NULL only for SUPER_ADMIN (platform-level users, not tied to a school)
+  tenantId String? @db.Uuid
+  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Nullable — a STUDENT or non-admin staff member's portal login can now
+  // be their system-generated ID instead of a real email (see `loginId`
+  // below); real email stays required for SCHOOL_ADMIN/PARENT/SUPER_ADMIN
+  // (and is still optional-but-supported for everyone else, purely to
+  // receive credentials/notifications when one happens to exist).
+  email        String?
+  // Normalized (lowercase, dashes stripped — see lib/loginId.ts) copy of
+  // the account's own generated code (StaffProfile.employeeCode or
+  // Student.studentCode), used to log in by ID instead of email. NULL for
+  // accounts that only ever log in with email (SUPER_ADMIN, PARENT, and
+  // the SCHOOL_ADMIN/"Principal" role).
+  loginId      String?
+  passwordHash String
+  fullName     String
+  phone        String?
+  role         UserRole
+  status       UserStatus @default(ACTIVE)
+
+  lastLoginAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  auditLogs           AuditLog[]
+
+  taughtSections          Section[]          @relation("SectionClassTeacher")
+  guardianProfile         Guardian?
+  taughtSectionSubjects   SectionSubject[]   @relation("SectionSubjectTeacher")
+  markedAttendanceRecords AttendanceRecord[] @relation("AttendanceMarkedBy")
+  enteredMarks            Mark[]             @relation("MarkEnteredBy")
+  submittedExamSubjects   ExamSubject[]      @relation("MarksSubmittedBy")
+  recordedPayments        Payment[]          @relation("PaymentRecordedBy")
+  staffProfile            StaffProfile?
+  createdClassTests       ClassTest[]        @relation("ClassTestCreatedBy")
+  enteredClassTestMarks   ClassTestMark[]    @relation("ClassTestMarkEnteredBy")
+
+  receivedNotifications Notification[] @relation("NotificationRecipient")
+  createdNotifications  Notification[] @relation("NotificationCreatedBy")
+
+  studentProfile Student?
+
+  issuedTransferCertificates TransferCertificate[] @relation("TransferCertificateIssuedBy")
+  voidedTransferCertificates TransferCertificate[] @relation("TransferCertificateVoidedBy")
+  requestedReportCardBatches ReportCardBatchJob[]  @relation("ReportCardBatchRequestedBy")
+
+  assignedHomework      Homework[]        @relation("HomeworkAssignedBy")
+  uploadedCourseMaterials CourseMaterial[] @relation("CourseMaterialUploadedBy")
+  reviewedLeaveRequests LeaveRequest[]    @relation("LeaveRequestReviewedBy")
+  publishedNotices      Notice[]          @relation("NoticePublishedBy")
+  receivedNotices       NoticeRecipient[]
+
+  requestedStudentLeaveRequests StudentLeaveRequest[] @relation("StudentLeaveRequestedBy")
+  reviewedStudentLeaveRequests  StudentLeaveRequest[] @relation("StudentLeaveRequestReviewedBy")
+
+  reportedDisciplineRecords DisciplineRecord[] @relation("DisciplineReportedBy")
+
+  coordinatedSupportNeeds SupportNeed[]       @relation("SupportNeedCoordinator")
+  createdSupportNeeds     SupportNeed[]       @relation("SupportNeedCreatedBy")
+  reviewedSupportNeeds    SupportNeedReview[] @relation("SupportNeedReviewedBy")
+
+  updatedHealthProfiles StudentHealthProfile[] @relation("HealthProfileUpdatedBy")
+  loggedHealthEntries   HealthLogEntry[]       @relation("HealthLogLoggedBy")
+
+  updatedStudentCustomFieldValues StudentCustomFieldValue[] @relation("StudentCustomFieldValueUpdatedBy")
+
+  grantedExamPaperAccess       ExamPaperAccessGrant[]   @relation("ExamPaperAccessGrantGrantedBy")
+  examPaperAccessGrants        ExamPaperAccessGrant[]   @relation("ExamPaperAccessGrantTeacher")
+  createdQuestionBankQuestions QuestionBankQuestion[]   @relation("QuestionBankQuestionCreatedBy")
+  generatedExamPapers          GeneratedExamPaper[]     @relation("GeneratedExamPaperGeneratedBy")
+
+  // Email must be unique within a tenant; platform admins (tenantId NULL)
+  // are unique globally by email via a separate partial index (see migration).
+  // Postgres treats multiple NULLs as distinct in a unique index, so any
+  // number of ID-only accounts (email NULL) can coexist without conflict.
+  @@unique([tenantId, email])
+  // Same NULLs-are-distinct property covers every account that has no
+  // ID-based login (SUPER_ADMIN/PARENT/SCHOOL_ADMIN) — loginId stays NULL
+  // for those and never collides.
+  @@unique([tenantId, loginId])
+  @@index([tenantId])
+  @@map("users")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Auth sessions
+// ────────────────────────────────────────────────────────────────
+
+model RefreshToken {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String? @db.Uuid
+  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // SHA-256 hash of the refresh token — the raw token is never stored
+  tokenHash String  @unique
+  userAgent String?
+  ipAddress String?
+
+  expiresAt           DateTime
+  revokedAt           DateTime?
+  replacedByTokenHash String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([tenantId])
+  @@map("refresh_tokens")
+}
+
+/**
+ * Self-service "forgot password" tokens (POST /api/auth/forgot-password ->
+ * /api/auth/reset-password) — tenant-scoped since forgot-password requires
+ * the same slug+email as login (see auth.service.ts). Only ever created
+ * for tenant portal users (STUDENT/PARENT/staff), not SUPER_ADMIN, so
+ * tenantId is required here unlike RefreshToken's nullable one.
+ */
+model PasswordResetToken {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // SHA-256 hash of the raw token — the raw token is only ever emailed to
+  // the user (or, outside production, echoed back in the response for
+  // local testing — see auth.controller.ts), never stored.
+  tokenHash String @unique
+
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([tenantId])
+  @@map("password_reset_tokens")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Audit log — security & compliance trail (production-grade requirement)
+// ────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String? @db.Uuid
+  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  actorUserId String? @db.Uuid
+  actor       User?   @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  action     String // e.g. "auth.login", "auth.signup", "user.invite"
+  entityType String? // e.g. "User", "Tenant"
+  entityId   String?
+  metadata   Json?
+  ipAddress  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Student Information System (Day 2)
+// ────────────────────────────────────────────────────────────────
+
+model AcademicYear {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name      String // e.g. "2025-2026"
+  startDate DateTime
+  endDate   DateTime
+  isActive  Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sections          Section[]
+  enrollments       Enrollment[]
+  exams             Exam[]
+  feeStructureItems FeeStructureItem[]
+  invoices          Invoice[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("academic_years")
+}
+
+// A grade level, e.g. "Nursery", "Class 5", "O-Level Year 1"
+model SchoolClass {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name  String
+  order Int // for sorting Nursery < KG < Class 1 < ... in the UI
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sections            Section[]
+  feeStructureItems   FeeStructureItem[]
+  reportCardBatchJobs ReportCardBatchJob[]
+
+  examPaperAccessGrants ExamPaperAccessGrant[]
+  questionBankQuestions QuestionBankQuestion[]
+  generatedExamPapers   GeneratedExamPaper[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("school_classes")
+}
+
+// A specific class + section for a given academic year, e.g. "Class 5 - A (2025-2026)"
+model Section {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  schoolClassId String      @db.Uuid
+  schoolClass   SchoolClass @relation(fields: [schoolClassId], references: [id], onDelete: Restrict)
+
+  academicYearId String       @db.Uuid
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id], onDelete: Restrict)
+
+  name           String // e.g. "A", "B", "Boys"
+  classTeacherId String? @db.Uuid
+  classTeacher   User?   @relation("SectionClassTeacher", fields: [classTeacherId], references: [id], onDelete: SetNull)
+
+  roomNumber String?
+  capacity   Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  students            Student[]
+  enrollments         Enrollment[]
+  sectionSubjects     SectionSubject[]
+  attendanceRecords   AttendanceRecord[]
+  homeworkAssignments Homework[]
+  notices             Notice[]
+  reportCardBatchJobs ReportCardBatchJob[]
+
+  @@unique([tenantId, schoolClassId, academicYearId, name])
+  @@index([tenantId])
+  @@index([tenantId, academicYearId])
+  @@map("sections")
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum StudentStatus {
+  ACTIVE
+  INACTIVE
+  GRADUATED
+  TRANSFERRED_OUT
+  EXPELLED
+}
+
+model Student {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Human-readable admission code, unique per tenant (e.g. "2026-000001")
+  studentCode String
+
+  // Class register / report-card display number — distinct from studentCode
+  // (the permanent admission ID). Unique within a section, not globally:
+  // it's ordinary for "Roll No. 5" to exist in every section. Nullable so
+  // an unassigned/newly-admitted student doesn't block on it.
+  rollNumber String?
+
+  fullName      String
+  gender        Gender
+  dateOfBirth   DateTime
+  admissionDate DateTime @default(now())
+  // Pakistan: B-Form (minors) or CNIC (adult students), format
+  // XXXXX-XXXXXXX-X — validated in validation.ts, not at the DB layer.
+  bFormOrCnic   String?
+  contactPhone  String?
+  address       String?
+  // Self-editable by the student via the portal's My Profile → About tab
+  // (PATCH /api/auth/me) — a name+phone, e.g. "Uncle Tariq - 0300-1234567",
+  // not a structured record. Distinct from StudentHealthProfile's
+  // emergencyContactName/Phone, which is the school nurse/front-desk's
+  // medical-emergency record — kept separate since the two are managed by
+  // different people for different purposes.
+  emergencyContact String?
+  city          String?
+  photoUrl      String?
+
+  status StudentStatus @default(ACTIVE)
+
+  // Current section is a denormalized convenience pointer; the source of
+  // truth for enrollment history is the Enrollment table.
+  currentSectionId String?  @db.Uuid
+  currentSection   Section? @relation(fields: [currentSectionId], references: [id], onDelete: SetNull)
+
+  // Optional linked login for the student portal (Day 9)
+  userId String? @unique @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  guardians            StudentGuardian[]
+  enrollments          Enrollment[]
+  attendanceRecords    AttendanceRecord[]
+  marks                Mark[]
+  classTestMarks       ClassTestMark[]
+  invoices             Invoice[]
+  payments             Payment[]
+  transferCertificates TransferCertificate[]
+  leaveRequests        StudentLeaveRequest[]
+  disciplineRecords    DisciplineRecord[]
+  supportNeeds         SupportNeed[]
+  healthProfile        StudentHealthProfile?
+  healthLogEntries     HealthLogEntry[]
+  customFieldValues    StudentCustomFieldValue[]
+  electiveEnrollments  StudentElectiveEnrollment[]
+
+  @@unique([tenantId, studentCode])
+  @@unique([tenantId, currentSectionId, rollNumber])
+  @@index([tenantId])
+  @@index([tenantId, currentSectionId])
+  @@index([tenantId, status])
+  @@index([tenantId, fullName])
+  @@map("students")
+}
+
+enum TransferCertificateReason {
+  PARENT_REQUEST
+  RELOCATION
+  ACADEMIC
+  DISCIPLINARY
+  GRADUATED
+  OTHER
+}
+
+// A student can only leave once per "episode" of enrollment, but may
+// re-admit later (rare) and leave again — so this is a list, not a 1:1.
+model TransferCertificate {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  // Human-readable, unique per tenant (e.g. "TC-2026-000001")
+  tcNumber String
+
+  issueDate          DateTime                  @db.Date
+  lastAttendanceDate DateTime?                 @db.Date
+  reason             TransferCertificateReason
+  conduct            String? // e.g. "Good", "Satisfactory"
+  remarks            String?
+
+  issuedByUserId String? @db.Uuid
+  issuedBy       User?   @relation("TransferCertificateIssuedBy", fields: [issuedByUserId], references: [id], onDelete: SetNull)
+
+  // Set when this TC was issued by mistake and undone (see
+  // sis/transferCertificates.ts's void route) — kept as a record rather
+  // than deleted, so the tcNumber sequence and print history stay
+  // auditable; voided TCs are flagged in the UI rather than hidden.
+  voidedAt       DateTime?
+  voidedByUserId String?   @db.Uuid
+  voidedBy       User?     @relation("TransferCertificateVoidedBy", fields: [voidedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, tcNumber])
+  @@index([tenantId])
+  @@index([tenantId, studentId])
+  @@map("transfer_certificates")
+}
+
+enum GuardianRelationship {
+  FATHER
+  MOTHER
+  GUARDIAN
+}
+
+model Guardian {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  fullName     String
+  relationship GuardianRelationship
+  cnic         String?
+  phone        String
+  email        String?
+  occupation   String?
+
+  // Optional linked login for the parent portal (Day 9)
+  userId String? @unique @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  students StudentGuardian[]
+
+  @@index([tenantId])
+  @@map("guardians")
+}
+
+model StudentGuardian {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  guardianId String   @db.Uuid
+  guardian   Guardian @relation(fields: [guardianId], references: [id], onDelete: Cascade)
+
+  isPrimary Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@unique([studentId, guardianId])
+  @@index([tenantId])
+  @@index([tenantId, guardianId])
+  @@map("student_guardians")
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  TRANSFERRED
+  COMPLETED
+  WITHDRAWN
+}
+
+// Historical record of which section a student belonged to, per academic year.
+model Enrollment {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  sectionId String  @db.Uuid
+  section   Section @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+
+  academicYearId String       @db.Uuid
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id], onDelete: Restrict)
+
+  status     EnrollmentStatus @default(ACTIVE)
+  enrolledAt DateTime         @default(now())
+  leftAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([studentId, academicYearId])
+  @@index([tenantId])
+  @@index([tenantId, sectionId])
+  @@map("enrollments")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Academics (Day 3): subjects, section-subject-teacher mapping, timetable
+// ────────────────────────────────────────────────────────────────
+
+model Subject {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name String
+  code String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sectionSubjects     SectionSubject[]
+  homeworkAssignments Homework[]
+
+  examPaperAccessGrants ExamPaperAccessGrant[]
+  questionBankQuestions QuestionBankQuestion[]
+  generatedExamPapers   GeneratedExamPaper[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("subjects")
+}
+
+// Which subject is taught in which section, by which teacher.
+model SectionSubject {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  sectionId String  @db.Uuid
+  section   Section @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  subjectId String  @db.Uuid
+  subject   Subject @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+
+  teacherId String? @db.Uuid
+  teacher   User?   @relation("SectionSubjectTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+
+  // false (default) = every student enrolled in the section takes this
+  // subject — the original, and still overwhelmingly common, Nursery-to-
+  // Matric shape, where a "section" already implies one fixed subject
+  // list. true = an elective/subject-combination subject (O/A-Level
+  // Physics vs Computer Science within the same section) — only students
+  // with a StudentElectiveEnrollment row for this row actually take it.
+  // Defaulting to false means every section-subject created before this
+  // field existed keeps behaving exactly as it always did.
+  isElective Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  timetableSlots      TimetableSlot[]
+  examSubjects        ExamSubject[]
+  electiveEnrollments StudentElectiveEnrollment[]
+  courseMaterials     CourseMaterial[]
+  classTests          ClassTest[]
+
+  @@unique([sectionId, subjectId])
+  @@index([tenantId])
+  @@index([tenantId, teacherId])
+  @@map("section_subjects")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Elective / subject-combination enrollment (Pakistan-adaptation note)
+// ────────────────────────────────────────────────────────────────
+// PowerScheduler is a full course-scheduling *optimizer* — it solves
+// room/period/teacher-conflict constraints across a district to
+// auto-build master timetables. That's a different, much bigger problem
+// than what O/A-Level Pakistani schools actually run into day to day:
+// they already build the timetable by hand (see TimetableSlot), the gap
+// is simply that not every student in a section studies every subject —
+// e.g. a Grade 11 section might have some students doing Biology and
+// others doing Computer Science alongside the shared core subjects. This
+// is just a roster: which specific students, from a section, are taking
+// one particular elective subject. No auto-scheduling, no conflict
+// solving — an admin ticks a subject "elective" and then picks the
+// students, and marks entry / report cards read from that roster instead
+// of assuming the whole section.
+model StudentElectiveEnrollment {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  sectionSubjectId String         @db.Uuid
+  sectionSubject   SectionSubject @relation(fields: [sectionSubjectId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([studentId, sectionSubjectId])
+  @@index([tenantId])
+  @@index([tenantId, sectionSubjectId])
+  @@map("student_elective_enrollments")
+}
+
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
+// A single recurring weekly period on the timetable.
+model TimetableSlot {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  sectionSubjectId String         @db.Uuid
+  sectionSubject   SectionSubject @relation(fields: [sectionSubjectId], references: [id], onDelete: Cascade)
+
+  dayOfWeek  DayOfWeek
+  startTime  DateTime  @db.Time
+  endTime    DateTime  @db.Time
+  roomNumber String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([tenantId, sectionSubjectId, dayOfWeek])
+  @@map("timetable_slots")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Attendance (Day 4)
+// ────────────────────────────────────────────────────────────────
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  LEAVE
+  HALF_DAY
+  // Present for part of the day then left before school closed (sent home
+  // sick, picked up early) — distinct from HALF_DAY, which is a pre-known
+  // half-day enrollment/schedule rather than an early departure on the day.
+  EARLY_LEAVE
+}
+
+model AttendanceRecord {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  // Denormalized so a section's daily roster can be queried without
+  // joining through Enrollment (a student's section can change over time,
+  // but a past attendance record should stay pinned to the section they
+  // were actually in that day).
+  sectionId String  @db.Uuid
+  section   Section @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+
+  date    DateTime         @db.Date
+  status  AttendanceStatus
+  remarks String?
+
+  markedByUserId String? @db.Uuid
+  markedBy       User?   @relation("AttendanceMarkedBy", fields: [markedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([studentId, date])
+  @@index([tenantId])
+  @@index([tenantId, sectionId, date])
+  @@map("attendance_records")
+}
+
+// A declared non-working day/range — Eid holidays, summer break, a public
+// holiday — school-wide (not per-section/class). Combined with
+// Tenant.weeklyOffDays (e.g. every Sunday) to compute whether a given date
+// has no class, for both blocking attendance-marking on that date and the
+// parent/student portal's "No class today" state.
+model Holiday {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name String
+
+  // Inclusive range — a single-day holiday has startDate == endDate.
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, startDate, endDate])
+  @@map("holidays")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Exams, grading, report cards (Day 5)
+// ────────────────────────────────────────────────────────────────
+
+model Exam {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  academicYearId String       @db.Uuid
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id], onDelete: Cascade)
+
+  name      String // e.g. "Mid Term", "Final Term"
+  startDate DateTime? @db.Date
+  endDate   DateTime? @db.Date
+
+  // Admin-set date by which every subject teacher should have submitted
+  // their marks for this exam (see ExamSubject.marksSubmittedAt) — purely
+  // informational/visibility, not an enforced lock: a teacher can still
+  // enter/edit marks after this date, the admin's "Submission status"
+  // view (exams.ts's submissionStatusHandler) just highlights it as
+  // overdue so the admin knows who to follow up with.
+  resultsDeadline DateTime? @db.Date
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  examSubjects        ExamSubject[]
+  reportCardBatchJobs ReportCardBatchJob[]
+
+  @@unique([academicYearId, name])
+  @@index([tenantId])
+  @@map("exams")
+}
+
+// Per-tenant configurable percentage->letter-grade bands (schools use
+// different scales — a Matric-board school and an O/A-Levels school
+// commonly disagree). Seeded with a sane default set at tenant signup
+// (see auth.service.ts) so existing behavior doesn't change until a
+// School Admin customizes it. `minPercentage` is the inclusive lower
+// bound of the band; grading.ts finds the highest band whose minPercentage
+// is <= the score.
+model GradingBand {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  grade         String // e.g. "A+"
+  minPercentage Decimal @db.Decimal(5, 2)
+  // Purely for stable display ordering (highest grade first) — the
+  // matching logic itself sorts by minPercentage, not this field.
+  sortOrder     Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, grade])
+  @@index([tenantId])
+  @@map("grading_bands")
+}
+
+enum ReportCardBatchJobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// Bulk "generate report cards for a whole class/exam" is too slow to do
+// inline on the request thread (one PDF per student). No Redis/BullMQ
+// exists in this deployment (see docs/DEPLOYMENT.md — single-VPS pm2), so
+// this is a DB-backed job row processed in-process via setImmediate
+// rather than a real durable multi-process queue: the API returns a job
+// id immediately, and the frontend polls status until COMPLETED/FAILED,
+// then downloads the resulting zip via resultFileUrl.
+model ReportCardBatchJob {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  classId String      @db.Uuid
+  class   SchoolClass @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  // Optional narrowing to one section of the class — null means "every
+  // section of this class" (the original, still-supported behavior).
+  // Added so an admin generating results for "Class 5 - Section B" doesn't
+  // have to wait for/download every other section's PDFs too.
+  sectionId String?  @db.Uuid
+  section   Section? @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  examId String @db.Uuid
+  exam   Exam   @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  status ReportCardBatchJobStatus @default(PENDING)
+
+  totalCount     Int @default(0)
+  processedCount Int @default(0)
+
+  // Populated once COMPLETED — path/URL of the generated zip of PDFs.
+  resultFileUrl String?
+  // Populated once FAILED — short diagnostic message (not a stack trace).
+  errorMessage  String?
+
+  requestedByUserId String @db.Uuid
+  requestedBy       User   @relation("ReportCardBatchRequestedBy", fields: [requestedByUserId], references: [id], onDelete: Cascade)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("report_card_batch_jobs")
+}
+
+// Which section-subject offering is examined, and out of how many marks.
+model ExamSubject {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  examId String @db.Uuid
+  exam   Exam   @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  sectionSubjectId String         @db.Uuid
+  sectionSubject   SectionSubject @relation(fields: [sectionSubjectId], references: [id], onDelete: Cascade)
+
+  maxMarks     Int
+  passingMarks Int
+
+  // The datesheet itself — which day (and, optionally, what time) this
+  // paper is held. Nullable so a subject added via the older single-add
+  // route (or before this field existed) doesn't break; the datesheet
+  // builder (exams.ts's /:examId/subjects/bulk) is what actually fills
+  // these in per class, and shows on the student/parent portal once set.
+  examDate  DateTime? @db.Date
+  startTime DateTime? @db.Time
+
+  // Explicit "I'm done entering marks for this class" signal from the
+  // subject teacher (or an admin on their behalf) — separate from just
+  // having some marks saved, since a teacher can save partial progress
+  // repeatedly before finalizing. Powers the admin "who has/hasn't
+  // submitted yet" view (see Exam.resultsDeadline and exams.ts's
+  // submissionStatusHandler). Un-submitting (clearing this) is allowed —
+  // e.g. to fix a mistake — so this is not a hard lock on further edits.
+  marksSubmittedAt       DateTime?
+  marksSubmittedByUserId String?   @db.Uuid
+  marksSubmittedBy       User?     @relation("MarksSubmittedBy", fields: [marksSubmittedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  marks Mark[]
+
+  @@unique([examId, sectionSubjectId])
+  @@index([tenantId])
+  @@map("exam_subjects")
+}
+
+model Mark {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  examSubjectId String      @db.Uuid
+  examSubject   ExamSubject @relation(fields: [examSubjectId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  marksObtained Float?
+  remarks       String?
+
+  enteredByUserId String? @db.Uuid
+  enteredBy       User?   @relation("MarkEnteredBy", fields: [enteredByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([examSubjectId, studentId])
+  @@index([tenantId])
+  @@index([tenantId, studentId])
+  @@map("marks")
+}
+
+// A teacher's own informal class test/quiz — deliberately NOT an Exam or
+// ExamSubject. An Exam is admin-scheduled, institution-wide, and feeds
+// report cards/rankings; a class test is one teacher's own one-off check
+// for a single subject they teach, created without going through admin at
+// all. Kept as a fully separate model (rather than, say, a "TEACHER can
+// create Exams too" flag) specifically so it can NEVER be picked up by
+// buildReportCard/computeSectionExamResults — those only ever query
+// Exam/ExamSubject/Mark, so a class test's marks structurally cannot leak
+// into a report card or class ranking, matching "class test final mein
+// count nahi hote" without needing an exclusion filter anywhere.
+model ClassTest {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  sectionSubjectId String         @db.Uuid
+  sectionSubject   SectionSubject @relation(fields: [sectionSubjectId], references: [id], onDelete: Cascade)
+
+  // Teacher-chosen label — "Class Test 1", "Chapter 3 Quiz", whatever they
+  // actually call it. No date/datesheet concept here (unlike ExamSubject)
+  // since a class test isn't scheduled ahead of time the way a formal exam
+  // paper is — it's created the same day it's taken, or after.
+  name         String
+  maxMarks     Int
+  passingMarks Int
+
+  createdByUserId String @db.Uuid
+  createdBy       User   @relation("ClassTestCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  marks ClassTestMark[]
+
+  @@index([tenantId])
+  @@index([tenantId, sectionSubjectId])
+  @@map("class_tests")
+}
+
+model ClassTestMark {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  classTestId String    @db.Uuid
+  classTest   ClassTest @relation(fields: [classTestId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  marksObtained Float?
+  remarks       String?
+
+  enteredByUserId String? @db.Uuid
+  enteredBy       User?   @relation("ClassTestMarkEnteredBy", fields: [enteredByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([classTestId, studentId])
+  @@index([tenantId])
+  @@index([tenantId, studentId])
+  @@map("class_test_marks")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Fee & Finance (Day 6)
+// ────────────────────────────────────────────────────────────────
+
+enum FeeFrequency {
+  ONE_TIME
+  MONTHLY
+  QUARTERLY
+  ANNUAL
+}
+
+model FeeCategory {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  feeStructureItems FeeStructureItem[]
+  invoiceLineItems  InvoiceLineItem[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("fee_categories")
+}
+
+// The fee plan: how much a given class owes for a given fee category, per year.
+model FeeStructureItem {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  academicYearId String       @db.Uuid
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id], onDelete: Cascade)
+
+  schoolClassId String      @db.Uuid
+  schoolClass   SchoolClass @relation(fields: [schoolClassId], references: [id], onDelete: Cascade)
+
+  feeCategoryId String      @db.Uuid
+  feeCategory   FeeCategory @relation(fields: [feeCategoryId], references: [id], onDelete: Restrict)
+
+  amount    Decimal      @db.Decimal(12, 2)
+  frequency FeeFrequency
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([academicYearId, schoolClassId, feeCategoryId])
+  @@index([tenantId])
+  @@map("fee_structure_items")
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+model Invoice {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  academicYearId String       @db.Uuid
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id], onDelete: Cascade)
+
+  // Human-readable, unique per tenant (e.g. "INV-2026-000001")
+  invoiceNumber String
+
+  // Billing period label, e.g. "2026-08" for a monthly invoice or
+  // "Term 1" for a termly one. One consolidated invoice per student per
+  // period (all due fee categories combined into one bill).
+  period String
+
+  issueDate DateTime @db.Date
+  dueDate   DateTime @db.Date
+
+  status      InvoiceStatus @default(UNPAID)
+  totalAmount Decimal       @db.Decimal(12, 2)
+  paidAmount  Decimal       @default(0) @db.Decimal(12, 2)
+
+  // Computed/persisted lazily by syncInvoiceOverdueState() on read and
+  // before payment recording — not maintained by a cron job. Zero until
+  // the invoice actually goes overdue under the tenant's LateFeePolicy.
+  lateFineAmount Decimal @default(0) @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lineItems InvoiceLineItem[]
+  payments  Payment[]
+
+  @@unique([tenantId, invoiceNumber])
+  @@unique([studentId, period])
+  @@index([tenantId])
+  @@index([tenantId, studentId])
+  @@index([tenantId, status])
+  @@index([tenantId, issueDate])
+  @@map("invoices")
+}
+
+model InvoiceLineItem {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  invoiceId String  @db.Uuid
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  feeCategoryId String      @db.Uuid
+  feeCategory   FeeCategory @relation(fields: [feeCategoryId], references: [id], onDelete: Restrict)
+
+  description String
+  amount      Decimal @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, invoiceId])
+  @@map("invoice_line_items")
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  CARD
+  ONLINE
+  CHEQUE
+}
+
+model Payment {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  invoiceId String  @db.Uuid
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  amount          Decimal       @db.Decimal(12, 2)
+  method          PaymentMethod
+  paidAt          DateTime      @default(now())
+  referenceNumber String?
+
+  recordedByUserId String? @db.Uuid
+  recordedBy       User?   @relation("PaymentRecordedBy", fields: [recordedByUserId], references: [id], onDelete: SetNull)
+
+  // Client-supplied key so a retried/duplicated request never records the
+  // same payment twice (production-grade payment idempotency).
+  idempotencyKey String
+
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId])
+  @@index([tenantId, invoiceId])
+  @@index([tenantId, studentId])
+  @@map("payments")
+}
+
+enum LateFeeType {
+  FIXED
+  PERCENTAGE
+}
+
+// One optional policy per tenant (v1 scope: a single flat rule applied to
+// every ONE_TIME/non-recurring invoice tenant-wide — no per-fee-category
+// overrides yet). Applied lazily by syncInvoiceOverdueState(), never by a
+// cron job — see Invoice.lateFineAmount.
+model LateFeePolicy {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @unique @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Days after Invoice.dueDate before the invoice is considered overdue
+  // and a fine is applied — schools commonly allow a short grace window.
+  graceDays Int @default(0)
+
+  fineType  LateFeeType
+  // FIXED: flat Rupee amount. PERCENTAGE: percent of Invoice.totalAmount.
+  fineValue Decimal     @db.Decimal(12, 2)
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("late_fee_policies")
+}
+
+// ────────────────────────────────────────────────────────────────
+// HR / Staff (Day 7)
+// ────────────────────────────────────────────────────────────────
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+}
+
+enum StaffStatus {
+  ACTIVE
+  ON_LEAVE
+  TERMINATED
+}
+
+model StaffProfile {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  userId String @unique @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Human-readable, unique per tenant (e.g. "EMP-000001")
+  employeeCode String
+
+  designation    String
+  department     String?
+  employmentType EmploymentType @default(FULL_TIME)
+  status         StaffStatus    @default(ACTIVE)
+
+  joiningDate DateTime  @db.Date
+  leavingDate DateTime? @db.Date
+
+  // Personal detail shown read-only on the staff member's own "My Profile"
+  // → Bio Data tab (see StaffProfile's existing cnic below for the rest of
+  // that tab) — admin/front-desk-entered at hiring, not self-editable.
+  // Nullable because existing staff rows predate this field.
+  dateOfBirth DateTime? @db.Date
+  gender      Gender?
+
+  cnic             String?
+  address          String?
+  emergencyContact String?
+  monthlySalary    Decimal @db.Decimal(12, 2)
+  // Self-service, uploaded via /api/uploads/image then PATCH /api/staff/me
+  // (see staff.ts) — shown on the teacher's own dashboard, the same way a
+  // student's photoUrl is shown on theirs. Distinct from Student.photoUrl,
+  // which an admin sets on the student's behalf; a staff member sets their
+  // own.
+  photoUrl String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payrollRecords PayrollRecord[]
+  leaveRequests  LeaveRequest[]
+
+  @@unique([tenantId, employeeCode])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("staff_profiles")
+}
+
+enum PayrollStatus {
+  PENDING
+  PAID
+}
+
+model PayrollRecord {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  staffProfileId String       @db.Uuid
+  staffProfile   StaffProfile @relation(fields: [staffProfileId], references: [id], onDelete: Cascade)
+
+  // "2026-02" style month label
+  month String
+
+  basicSalary Decimal @db.Decimal(12, 2)
+  allowances  Decimal @default(0) @db.Decimal(12, 2)
+  deductions  Decimal @default(0) @db.Decimal(12, 2)
+  netSalary   Decimal @db.Decimal(12, 2)
+
+  status PayrollStatus @default(PENDING)
+  paidAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([staffProfileId, month])
+  @@index([tenantId])
+  @@map("payroll_records")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Communication (Day 8)
+// ────────────────────────────────────────────────────────────────
+
+enum NotificationChannel {
+  IN_APP
+  SMS
+  EMAIL
+  WHATSAPP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model Notification {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  channel NotificationChannel
+
+  // In-app notifications (and staff SMS/email resolved from their profile)
+  // target a User. Guardian broadcasts (no login required) go straight to
+  // a phone/email captured at send time instead.
+  recipientUserId String? @db.Uuid
+  recipientUser   User?   @relation("NotificationRecipient", fields: [recipientUserId], references: [id], onDelete: Cascade)
+  recipientPhone  String?
+  recipientEmail  String?
+
+  subject String?
+  body    String
+
+  status            NotificationStatus @default(PENDING)
+  providerMessageId String?
+  errorMessage      String?
+
+  // Freeform link back to the record that triggered this notification
+  // (e.g. "Invoice" / <invoiceId>) — no FK, since the target entity type varies.
+  relatedEntityType String?
+  relatedEntityId   String? @db.Uuid
+
+  createdByUserId String? @db.Uuid
+  createdByUser   User?   @relation("NotificationCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  readAt DateTime?
+
+  createdAt DateTime  @default(now())
+  sentAt    DateTime?
+
+  @@index([tenantId])
+  @@index([tenantId, recipientUserId])
+  @@map("notifications")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Homework — per-section, per-subject assignments set by a teacher.
+// Deliberately scoped to the assignment itself (title/description/due
+// date), not a submission-tracking workflow — that's a large enough
+// feature (file uploads, per-student grading, late-submission rules) to
+// be its own phase if/when a school actually asks for it.
+// ────────────────────────────────────────────────────────────────
+
+model Homework {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  sectionId String  @db.Uuid
+  section   Section @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  subjectId String  @db.Uuid
+  subject   Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+  dueDate     DateTime @db.Date
+
+  assignedByUserId String @db.Uuid
+  assignedByUser   User   @relation("HomeworkAssignedBy", fields: [assignedByUserId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Optional — a teacher can attach one file (worksheet, instructions,
+  // scanned question paper) to an assignment via the same generic
+  // /api/uploads/document endpoint CourseMaterial uses below. Most
+  // homework is still just a title + due date with no attachment, so this
+  // stays optional rather than forcing every assignment through an upload.
+  attachmentUrl String?
+
+  @@index([tenantId, sectionId, dueDate])
+  @@map("homework")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Course material — files (PDFs, PPT slides, scanned notes) a teacher
+// shares against one specific section-subject ("course" in the
+// student-portal's course-card sense), separate from Homework (an
+// assignment with a due date) and Notice (a section-wide announcement).
+// This is intentionally the simplest possible shape — a title plus one
+// uploaded file per row — since a school wanting versioning, folders, or
+// per-student visibility is a different, much larger feature.
+// ────────────────────────────────────────────────────────────────
+
+model CourseMaterial {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  sectionSubjectId String         @db.Uuid
+  sectionSubject   SectionSubject @relation(fields: [sectionSubjectId], references: [id], onDelete: Cascade)
+
+  title   String
+  fileUrl String
+
+  uploadedByUserId String @db.Uuid
+  uploadedByUser   User   @relation("CourseMaterialUploadedBy", fields: [uploadedByUserId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, sectionSubjectId])
+  @@map("course_materials")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Staff leave requests — a simple request → approve/reject workflow.
+// ────────────────────────────────────────────────────────────────
+
+enum LeaveType {
+  SICK
+  CASUAL
+  ANNUAL
+  UNPAID
+  OTHER
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model LeaveRequest {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  staffProfileId String       @db.Uuid
+  staffProfile   StaffProfile @relation(fields: [staffProfileId], references: [id], onDelete: Cascade)
+
+  leaveType LeaveType
+  fromDate  DateTime  @db.Date
+  toDate    DateTime  @db.Date
+  reason    String
+
+  status     LeaveStatus @default(PENDING)
+  reviewNote String?
+  reviewedAt DateTime?
+
+  reviewedByUserId String? @db.Uuid
+  reviewedByUser   User?   @relation("LeaveRequestReviewedBy", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, staffProfileId])
+  @@index([tenantId, status])
+  @@map("leave_requests")
+}
+
+// A student's absence/leave request — distinct from LeaveRequest above
+// (which is staff HR leave). Creation is PARENT-portal-only (a parent
+// requesting leave for their own child); it's then visible to every
+// teacher who teaches that student (class teacher AND any subject
+// teacher — see lib/teacherScope.ts) plus SCHOOL_ADMIN, either of whom
+// may approve/reject it.
+model StudentLeaveRequest {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  // The PARENT portal user who submitted this request on the student's behalf.
+  requestedByUserId String @db.Uuid
+  requestedByUser   User   @relation("StudentLeaveRequestedBy", fields: [requestedByUserId], references: [id], onDelete: Cascade)
+
+  fromDate DateTime @db.Date
+  toDate   DateTime @db.Date
+  reason   String
+
+  status     LeaveStatus @default(PENDING)
+  reviewNote String?
+  reviewedAt DateTime?
+
+  reviewedByUserId String? @db.Uuid
+  reviewedByUser   User?   @relation("StudentLeaveRequestReviewedBy", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, studentId])
+  @@index([tenantId, status])
+  @@map("student_leave_requests")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Notices / announcements — a school-wide or section-scoped bulletin,
+// distinct from the ephemeral Notification inbox: notices are meant to
+// be browsed as a list (with pinning), not delivered-and-dismissed.
+// ────────────────────────────────────────────────────────────────
+
+enum NoticeAudience {
+  ALL_STAFF
+  ALL_GUARDIANS
+  // School-wide notice to every currently-enrolled student (the student-side
+  // counterpart of ALL_GUARDIANS — previously missing entirely).
+  ALL_STUDENTS
+  SECTION
+  // One or more specific people (any mix of students/guardians/staff),
+  // resolved into concrete NoticeRecipient rows at publish time — the
+  // "choose individually or choose several" case, distinct from every
+  // other audience value above, which are all broad/self-describing.
+  INDIVIDUAL
+}
+
+// A lightweight "how urgent/what kind" label shown as a colored badge next
+// to a notice — orthogonal to isPinned (pinning controls sort order, tone
+// controls how it reads at a glance). Defaults to GENERAL so every existing
+// notice keeps rendering the same neutral badge it always implicitly had.
+enum NoticeTone {
+  GENERAL
+  IMPORTANT
+  URGENT
+  EVENT
+  HOLIDAY
+}
+
+model Notice {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  title String
+  body  String
+
+  // One notice can now target several audiences at once (e.g. every
+  // student AND every guardian, or a whole section PLUS a couple of named
+  // individuals) instead of being pinned to exactly one — a school-wide
+  // announcement and its parent-facing counterpart used to require two
+  // separate notices even when the wording was identical.
+  audiences NoticeAudience[]
+  // Denormalized at write time: true only when `audiences` is EXACTLY
+  // `[INDIVIDUAL]` — i.e. this notice has no broad component at all and is
+  // addressed solely to named people. Drives the "don't leak this to every
+  // other staff member" privacy carve-out in the list query below; a
+  // notice that combines INDIVIDUAL with any broad audience is already
+  // visible to that broad audience, so the carve-out no longer applies.
+  individualOnly Boolean @default(false)
+  // Only set (and only meaningful) when `audiences` includes SECTION.
+  sectionId String?  @db.Uuid
+  section   Section? @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  tone NoticeTone @default(GENERAL)
+
+  isPinned Boolean @default(false)
+
+  publishedByUserId String @db.Uuid
+  publishedByUser   User   @relation("NoticePublishedBy", fields: [publishedByUserId], references: [id], onDelete: Cascade)
+
+  publishedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Only populated (and only meaningful) when `audiences` includes INDIVIDUAL.
+  recipients NoticeRecipient[]
+
+  @@index([tenantId, publishedAt])
+  @@index([tenantId, individualOnly])
+  @@map("notices")
+}
+
+// One explicit recipient of an INDIVIDUAL-audience notice. `userId` points
+// at the shared User table directly, so the same model works uniformly
+// whether the recipient is a STUDENT, PARENT, or staff-role account.
+model NoticeRecipient {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  noticeId String @db.Uuid
+  notice   Notice @relation(fields: [noticeId], references: [id], onDelete: Cascade)
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([noticeId, userId])
+  @@index([tenantId])
+  @@index([tenantId, userId])
+  @@map("notice_recipients")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Discipline / conduct records
+//
+// Deliberately modeled as a simple operational incident register — the
+// paper "complaint register" / conduct diary most Pakistani schools
+// already keep — NOT PowerSchool's US IDEA/Section-504-style special-
+// education discipline apparatus (manifestation determination reviews,
+// formal due-process hearings, etc.), which assumes a US legal framework
+// this app's market doesn't operate under. A student's overall conduct is
+// already captured as a free-text field on their Transfer Certificate
+// (TransferCertificate.conduct) when they leave; this log is what an admin
+// or class teacher would actually want to glance at before writing that.
+// ────────────────────────────────────────────────────────────────
+
+// Deliberately Pakistani-classroom-shaped, not a generic/US behavior-code
+// taxonomy — these are the incident types a front-desk/class-teacher
+// register here actually needs, in the school's own everyday language.
+enum DisciplineCategory {
+  UNIFORM_VIOLATION
+  LATE_ARRIVAL
+  MISSED_HOMEWORK
+  DISRUPTIVE_BEHAVIOR
+  DISRESPECT_TO_STAFF
+  BULLYING
+  FIGHTING
+  CHEATING
+  PROPERTY_DAMAGE
+  UNAUTHORIZED_ABSENCE
+  MOBILE_PHONE_VIOLATION
+  OTHER
+}
+
+enum DisciplineSeverity {
+  MINOR
+  MODERATE
+  MAJOR
+}
+
+// What was actually done about it — the small, informal set of responses a
+// Pakistani school actually has (no "manifestation determination review" /
+// "expedited hearing" style formal due-process steps).
+enum DisciplineAction {
+  NONE
+  VERBAL_WARNING
+  WRITTEN_WARNING
+  DETENTION
+  PARENT_CALLED
+  PARENT_MEETING_REQUIRED
+  SUSPENSION
+  REFERRED_TO_PRINCIPAL
+}
+
+model DisciplineRecord {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  incidentDate DateTime           @db.Date
+  category     DisciplineCategory
+  severity     DisciplineSeverity
+  description  String
+  actionTaken  DisciplineAction   @default(NONE)
+  actionNotes  String?
+
+  reportedByUserId String @db.Uuid
+  reportedByUser   User   @relation("DisciplineReportedBy", fields: [reportedByUserId], references: [id], onDelete: Restrict)
+
+  // Whether the guardian was actually informed — a manual flag, not
+  // auto-derived: a phone call home leaves no system trace to check
+  // against, so whoever logged the incident marks this themselves (see
+  // discipline.ts's optional "also send a notification" convenience,
+  // which sets this automatically only for that specific path).
+  guardianNotified   Boolean   @default(false)
+  guardianNotifiedAt DateTime?
+
+  resolved     Boolean   @default(false)
+  resolvedAt   DateTime?
+  resolvedNote String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, studentId])
+  @@index([tenantId, incidentDate])
+  @@map("discipline_records")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Learning support plans (inclusive education)
+//
+// Deliberately modeled as an informal, school-managed "Learning Support
+// Plan" — the kind of lightweight support-and-accommodations record
+// Pakistani inclusive-education programs actually keep — NOT a copy of
+// PowerSchool's US IDEA/Section-504 IEP machinery (which assumes a formal
+// due-process legal framework: eligibility determination hearings,
+// procedural-safeguards notices, annual IEP-team meetings with mandated
+// membership, etc. — none of which exists in, or is required by, Pakistan's
+// education system). There is also usually no formal clinical diagnosis on
+// file — many families here don't have access to one — so this tracks
+// "the school has identified this need and is providing this support",
+// not a medical/legal determination. Reviewed periodically (see
+// SupportNeedReview) rather than through a mandated annual meeting cycle.
+// ────────────────────────────────────────────────────────────────
+
+enum SupportNeedCategory {
+  LEARNING_SUPPORT // e.g. reading/writing/numeracy difficulty
+  ATTENTION_FOCUS_SUPPORT
+  SPEECH_LANGUAGE_SUPPORT
+  HEARING_SUPPORT
+  VISION_SUPPORT
+  MOBILITY_PHYSICAL_SUPPORT
+  SOCIAL_EMOTIONAL_SUPPORT
+  AUTISM_SPECTRUM_SUPPORT
+  INTELLECTUAL_DEVELOPMENTAL_SUPPORT
+  // Inclusive education isn't only about disability — a student who is
+  // far ahead of their section and needs enrichment/acceleration fits the
+  // same "identify the need, plan the support, review periodically"
+  // shape, so it's included here rather than left uncovered.
+  GIFTED_TALENTED_SUPPORT
+  OTHER
+}
+
+enum SupportNeedStatus {
+  ACTIVE
+  UNDER_REVIEW
+  RESOLVED
+  DISCONTINUED
+}
+
+model SupportNeed {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  category    SupportNeedCategory
+  description String // the nature of the need, in the school's own words — not a clinical diagnosis
+  identifiedDate DateTime @db.Date
+  status         SupportNeedStatus @default(ACTIVE)
+
+  // Classroom-level strategies (seating, simplified materials, buddy
+  // support, resource-room time, etc.) — kept separate from exam-specific
+  // accommodations below since they're used in different places (the
+  // classroom day-to-day vs. an exam room).
+  supportProvided    String
+  examAccommodations String? // e.g. "extra 30 minutes", "separate room", "reader/scribe allowed"
+
+  // The staff member coordinating this student's support — often a
+  // counselor or senior teacher in Pakistani schools' informal inclusive-
+  // education setups, not a legally-mandated case manager role.
+  coordinatorUserId String? @db.Uuid
+  coordinatorUser   User?   @relation("SupportNeedCoordinator", fields: [coordinatorUserId], references: [id], onDelete: SetNull)
+
+  nextReviewDate DateTime? @db.Date
+
+  createdByUserId String @db.Uuid
+  createdByUser   User   @relation("SupportNeedCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reviews SupportNeedReview[]
+
+  @@index([tenantId, studentId])
+  @@index([tenantId, status])
+  @@map("support_needs")
+}
+
+// A periodic check-in on a support plan — "reviewed on this date, here's
+// how it's going, status is now X" — distinct from DisciplineRecord's
+// single resolved/resolvedNote pair because a support plan is expected to
+// be revisited multiple times over a student's time at the school, not
+// resolved once and closed.
+model SupportNeedReview {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  supportNeedId String      @db.Uuid
+  supportNeed   SupportNeed @relation(fields: [supportNeedId], references: [id], onDelete: Cascade)
+
+  reviewDate    DateTime          @db.Date
+  notes         String
+  updatedStatus SupportNeedStatus?
+
+  reviewedByUserId String @db.Uuid
+  reviewedByUser   User   @relation("SupportNeedReviewedBy", fields: [reviewedByUserId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, supportNeedId])
+  @@map("support_need_reviews")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Health records (Batch E of the PowerSchool-gap work) — Pakistan-adapted.
+//
+// PowerSchool's US health module is built to interface with a state
+// immunization registry, insurance/HIPAA-regulated data sharing, and a
+// school nurse role with clinical charting duties. None of that
+// infrastructure exists for a Pakistani private school: there's no
+// national school-immunization registry to sync with, no school-nurse
+// licensing regime, and no insurance claims process running through the
+// school. What a Pakistani school's front office actually needs is much
+// simpler and more practical: (1) a quick-reference card per student —
+// blood group, allergies, chronic conditions, emergency contacts — that
+// office/teaching staff can pull up in a hurry, and (2) a first-aid /
+// clinic-visit log for whenever a student gets hurt or falls sick during
+// the school day, mainly for the school's own record-keeping and to show
+// a parent exactly what happened and when. So instead of a clinical EHR,
+// this is two lightweight models: StudentHealthProfile (the reference
+// card, one per student, kept up to date by the front office) and
+// HealthLogEntry (an append-only visit log, one row per incident).
+// ────────────────────────────────────────────────────────────────
+
+enum BloodGroup {
+  A_POSITIVE
+  A_NEGATIVE
+  B_POSITIVE
+  B_NEGATIVE
+  AB_POSITIVE
+  AB_NEGATIVE
+  O_POSITIVE
+  O_NEGATIVE
+  UNKNOWN
+}
+
+// One per student — the office's quick-reference medical card, not a
+// clinical chart. Kept as its own table (rather than columns bolted onto
+// Student) since it's optional, sensitive, and maintained by a narrower
+// set of staff than the rest of the student profile.
+model StudentHealthProfile {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @unique @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  bloodGroup BloodGroup?
+
+  allergies             String? // e.g. "Penicillin, peanuts"
+  chronicConditions     String? // e.g. "Asthma, mild epilepsy"
+  currentMedications    String?
+  emergencyMedicalNotes String? // free text — anything staff should know in an emergency
+
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  doctorName            String?
+  doctorPhone           String?
+
+  updatedByUserId String @db.Uuid
+  updatedByUser   User   @relation("HealthProfileUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, studentId])
+  @@map("student_health_profiles")
+}
+
+enum HealthLogOutcome {
+  RETURNED_TO_CLASS
+  SENT_HOME
+  TAKEN_TO_HOSPITAL
+  PARENT_CALLED_TO_COLLECT
+}
+
+// An append-only first-aid / clinic-visit log — "student came in with X on
+// this date, here's what was done, here's how it ended". Distinct from
+// StudentHealthProfile above: the profile is a slowly-changing reference
+// card, this is a running history of individual visits/incidents.
+model HealthLogEntry {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  visitDate   DateTime         @db.Date
+  complaint   String // symptom/reason for the visit, e.g. "fever", "fell during sports period"
+  actionTaken String // first aid given, rest, medicine given, etc.
+  outcome     HealthLogOutcome @default(RETURNED_TO_CLASS)
+
+  guardianNotified   Boolean   @default(false)
+  guardianNotifiedAt DateTime?
+
+  loggedByUserId String @db.Uuid
+  loggedByUser   User   @relation("HealthLogLoggedBy", fields: [loggedByUserId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, studentId])
+  @@index([tenantId, visitDate])
+  @@map("health_log_entries")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Custom fields (Pakistan-adaptation note)
+// ────────────────────────────────────────────────────────────────
+// PowerSchool's answer to "we need one more field on the student record"
+// is Custom Screens — a full page-builder with its own layout/permission
+// system, meant for large US districts standardizing dozens of screens
+// across many schools. A single Pakistani school just wants to capture a
+// handful of ad hoc facts it actually asks for at admission time —
+// transport route, father's occupation, previous school, tuition
+// discount reason, whatever — without engaging vendor support to add a
+// column. So this is deliberately minimal: one per-tenant list of field
+// definitions (admin-configurable, same footprint as FeeCategory) and one
+// generic value store keyed by (student, field). No page/layout builder,
+// no per-field permissions beyond the existing student read/write roles.
+enum CustomFieldType {
+  TEXT
+  NUMBER
+  DATE
+  BOOLEAN
+  SELECT
+}
+
+// A school-defined extra field to track on students. No audit/createdBy
+// tracking — this is schema-level configuration (who set up the field
+// list), not an operational record, so it follows the same minimal shape
+// as FeeCategory rather than the richer discipline/health models.
+model CustomFieldDefinition {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  label     String // e.g. "Transport Route", "Father's Occupation"
+  fieldType CustomFieldType
+  options   Json? // array of option strings — only meaningful when fieldType == SELECT
+  required  Boolean @default(false) // informational for the frontend form; not enforced server-side on value save
+  active    Boolean @default(true) // soft-disable: hides from new-entry forms, keeps existing values/history intact
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  values StudentCustomFieldValue[]
+
+  @@unique([tenantId, label])
+  @@index([tenantId])
+  @@map("custom_field_definitions")
+}
+
+// The value a student holds for one custom field. This DOES track who
+// last touched it (unlike the definition above) — it's per-student data
+// entered over time by office staff, the same reason StudentHealthProfile
+// tracks updatedByUserId.
+model StudentCustomFieldValue {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  fieldDefinitionId String                @db.Uuid
+  fieldDefinition   CustomFieldDefinition @relation(fields: [fieldDefinitionId], references: [id], onDelete: Cascade)
+
+  // Stored as text regardless of fieldType — a NUMBER is stringified, a
+  // BOOLEAN is "true"/"false", a DATE is an ISO date string — parsed back
+  // per fieldType by the API/frontend. Keeps this table schema-flexible
+  // without a column-per-type sparse design.
+  value String
+
+  updatedByUserId String @db.Uuid
+  updatedByUser   User   @relation("StudentCustomFieldValueUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([studentId, fieldDefinitionId])
+  @@index([tenantId])
+  @@index([tenantId, studentId])
+  @@map("student_custom_field_values")
+}
+
+// ────────────────────────────────────────────────────────────────
+// Exam Generator (deterministic — no AI). Three pieces:
+// 1. ExamPaperAccessGrant: admin-granted, per (SchoolClass, Subject),
+//    per-TEACHER permission to *generate* a paper. SCHOOL_ADMIN always
+//    bypasses this check (see examGenerator/generate.ts's
+//    assertGenerateAccess).
+// 2. QuestionBankQuestion: a shared, tenant-wide bank of questions per
+//    (SchoolClass, Subject) — deliberately NOT gated by the access grant
+//    above; any TEACHER or SCHOOL_ADMIN may contribute questions for any
+//    class/subject (collaborative knowledge-building — only *generating*
+//    a paper is access-gated).
+// 3. GeneratedExamPaper / GeneratedExamQuestion: the immutable result of
+//    one "Generate" action. GeneratedExamQuestion COPIES every field it
+//    needs off the source QuestionBankQuestion at generation time rather
+//    than only holding a live FK, specifically so that editing or
+//    deleting the underlying bank question later never changes (or
+//    breaks) a paper that was already generated and handed out —
+//    sourceQuestionId is kept only as a best-effort traceability pointer
+//    (onDelete: SetNull) and is never read to render a paper.
+// ────────────────────────────────────────────────────────────────
+
+enum QuestionBankQuestionType {
+  MCQ
+  SHORT_ANSWER
+  LONG_ANSWER
+}
+
+// One admin-granted permission for one TEACHER to generate exam papers
+// for one (SchoolClass, Subject) combination. SCHOOL_ADMIN needs no grant
+// row at all — see assertGenerateAccess, which short-circuits for that
+// role. Revocation is a hard delete (no history requirement was asked
+// for here, unlike TransferCertificate's void-not-delete pattern).
+model ExamPaperAccessGrant {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  schoolClassId String      @db.Uuid
+  schoolClass   SchoolClass @relation(fields: [schoolClassId], references: [id], onDelete: Restrict)
+
+  subjectId String  @db.Uuid
+  subject   Subject @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+
+  teacherId String @db.Uuid
+  teacher   User   @relation("ExamPaperAccessGrantTeacher", fields: [teacherId], references: [id], onDelete: Cascade)
+
+  grantedByUserId String @db.Uuid
+  grantedBy       User   @relation("ExamPaperAccessGrantGrantedBy", fields: [grantedByUserId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@unique([schoolClassId, subjectId, teacherId])
+  @@index([tenantId])
+  @@index([tenantId, teacherId])
+  @@map("exam_paper_access_grants")
+}
+
+// One question in the shared, tenant-wide question bank for one
+// (SchoolClass, Subject). `chapter` is a free-text tag (no separate
+// Chapter model — schools name/order chapters differently, so a
+// controlled list would need per-tenant admin setup for no real benefit).
+// `marks` is meaningful for every type, but for MCQ it's forced to 1
+// server-side regardless of what's posted (see questionBank.ts).
+model QuestionBankQuestion {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  schoolClassId String      @db.Uuid
+  schoolClass   SchoolClass @relation(fields: [schoolClassId], references: [id], onDelete: Restrict)
+
+  subjectId String  @db.Uuid
+  subject   Subject @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+
+  type         QuestionBankQuestionType
+  questionText String
+  chapter      String? // free-text tag, e.g. "Chapter 3: Photosynthesis" — for later filtering only
+  marks        Int                      @default(1)
+
+  // Only meaningful (and only populated) when type == MCQ: 2-6 answer
+  // options, and which index is correct. Validated in
+  // examGenerator/validation.ts, not at the DB layer — same pattern as
+  // CustomFieldDefinition.options.
+  options            Json? // string[], 2-6 entries, only when type == MCQ
+  correctOptionIndex Int? // index into `options`, only when type == MCQ
+
+  createdByUserId String @db.Uuid
+  createdBy       User   @relation("QuestionBankQuestionCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  generatedQuestions GeneratedExamQuestion[]
+
+  @@index([tenantId])
+  @@index([tenantId, schoolClassId, subjectId])
+  @@index([tenantId, schoolClassId, subjectId, chapter])
+  @@index([tenantId, schoolClassId, subjectId, type])
+  @@map("question_bank_questions")
+}
+
+// One "Generate Exam" action's saved result — the paper's header/summary.
+// Immutable once created (no update route); re-downloadable via its own
+// /pdf route at any time, regardless of what happens to the bank
+// afterwards.
+model GeneratedExamPaper {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  schoolClassId String      @db.Uuid
+  schoolClass   SchoolClass @relation(fields: [schoolClassId], references: [id], onDelete: Restrict)
+
+  subjectId String  @db.Uuid
+  subject   Subject @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+
+  // Snapshot of the chapter filter used at generation time, purely for
+  // display on the history list ("Chapters 1, 3" vs "All chapters" when
+  // empty) — not used to re-derive anything.
+  chapters String[] @default([])
+
+  mcqCount   Int
+  shortCount Int
+  longCount  Int
+  totalMarks Int // sum of every snapshot question's `marks`, computed once at generation time
+
+  generatedByUserId String @db.Uuid
+  generatedBy       User   @relation("GeneratedExamPaperGeneratedBy", fields: [generatedByUserId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  questions GeneratedExamQuestion[]
+
+  @@index([tenantId])
+  @@index([tenantId, schoolClassId, subjectId])
+  @@map("generated_exam_papers")
+}
+
+// One question as it appeared on one generated paper — a full copy, not a
+// live join, so it survives the source question being edited or deleted.
+model GeneratedExamQuestion {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  paperId String             @db.Uuid
+  paper   GeneratedExamPaper @relation(fields: [paperId], references: [id], onDelete: Cascade)
+
+  // Best-effort traceability back to the bank only — never read when
+  // rendering a paper (JSON or PDF always reads the copied fields below).
+  sourceQuestionId String?               @db.Uuid
+  sourceQuestion   QuestionBankQuestion? @relation(fields: [sourceQuestionId], references: [id], onDelete: SetNull)
+
+  type         QuestionBankQuestionType
+  questionText String
+  chapter      String?
+  marks        Int
+
+  options            Json?
+  correctOptionIndex Int?
+
+  // Display order on the paper — MCQs first (in selection order), then
+  // Short Answer, then Long Answer, each block numbered from 1.
+  order Int
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, paperId])
+  @@map("generated_exam_questions")
+}
