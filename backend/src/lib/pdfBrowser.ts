@@ -1,12 +1,52 @@
+import fs from 'fs';
 import puppeteer, { type Browser } from 'puppeteer-core';
 import { logger } from './logger';
 
-// Puppeteer's own Chromium download is skipped — we point it at the
-// Chromium binary already provisioned in this environment. In a real
-// deployment this should be set via an env var (or swapped for a hosted
-// browser service); hardcoding here is a Day-5 shortcut worth revisiting
-// before going to production on a different host.
-const CHROMIUM_PATH = process.env.CHROMIUM_EXECUTABLE_PATH ?? '/opt/pw-browsers/chromium';
+// This project's own dev/CI sandbox has a Chromium binary preinstalled at
+// this fixed path. When present, it's used exactly as before — this keeps
+// local development and the existing test suite (which render real PDFs)
+// completely unaffected by the fallback added below.
+const SANDBOX_CHROMIUM_PATH = '/opt/pw-browsers/chromium';
+
+interface ChromiumLaunchOptions {
+  executablePath: string;
+  args: string[];
+}
+
+/**
+ * Resolves which Chromium binary + launch flags to use, in priority order:
+ *
+ * 1. `CHROMIUM_EXECUTABLE_PATH` env var — an explicit override, for a host
+ *    that already has its own Chrome/Chromium install (e.g. a VPS with
+ *    `apt install chromium` run on it).
+ * 2. This project's dev/CI sandbox binary, when present — unchanged from
+ *    before.
+ * 3. `@sparticuz/chromium`'s bundled, serverless-friendly static binary —
+ *    the fallback for a fresh host with neither of the above (e.g. a
+ *    Render/Railway-style web service with no system Chromium installed).
+ *    Only ever required in that fallback case, so it costs nothing on a
+ *    host where (1) or (2) already applies.
+ */
+async function resolveLaunchOptions(): Promise<ChromiumLaunchOptions> {
+  if (process.env.CHROMIUM_EXECUTABLE_PATH) {
+    return {
+      executablePath: process.env.CHROMIUM_EXECUTABLE_PATH,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    };
+  }
+  if (fs.existsSync(SANDBOX_CHROMIUM_PATH)) {
+    return {
+      executablePath: SANDBOX_CHROMIUM_PATH,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    };
+  }
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const chromium = require('@sparticuz/chromium') as typeof import('@sparticuz/chromium');
+  return {
+    executablePath: await chromium.executablePath(),
+    args: chromium.args,
+  };
+}
 
 let browserPromise: Promise<Browser> | null = null;
 
@@ -29,12 +69,14 @@ let browserPromise: Promise<Browser> | null = null;
  */
 async function getBrowser(): Promise<Browser> {
   if (!browserPromise) {
-    browserPromise = puppeteer
-      .launch({
-        executablePath: CHROMIUM_PATH,
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      })
+    browserPromise = resolveLaunchOptions()
+      .then(({ executablePath, args }) =>
+        puppeteer.launch({
+          executablePath,
+          headless: true,
+          args,
+        }),
+      )
       .catch((err) => {
         browserPromise = null; // allow retry on next call instead of caching a rejected promise
         throw err;
