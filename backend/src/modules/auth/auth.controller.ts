@@ -17,6 +17,7 @@ import { AppError } from '../../utils/AppError';
 import { runWithTenant } from '../../lib/tenantContext';
 import { prisma } from '../../lib/prisma';
 import { param } from '../../utils/params';
+import { listPlans } from '../../config/plans';
 
 // Exported so rateLimiter.ts's refresh-endpoint key generator can read the
 // same cookie name to identify the caller for its own budget partitioning
@@ -137,6 +138,14 @@ export async function resolveSchoolHandler(req: Request, res: Response) {
   const slug = slugSchema.parse(param(req, 'slug'));
   const result = await authService.resolveSchool(slug);
   res.status(200).json({ data: result });
+}
+
+// Public — no auth, called from the signup page's plan-selection step
+// before any account exists. Only ever returns active plans: a
+// deactivated tier (see platform/plans.ts) is still valid on tenants
+// already assigned to it, but must not be offered to a new signup.
+export async function plansHandler(_req: Request, res: Response) {
+  res.status(200).json({ data: await listPlans({ includeInactive: false }) });
 }
 
 export async function loginHandler(req: Request, res: Response) {

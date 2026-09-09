@@ -1,5 +1,6 @@
 import { randomUUID, randomBytes } from 'crypto';
-import type { UserRole, TenantPlan, Prisma, RefreshToken } from '@prisma/client';
+import type { UserRole, Prisma, RefreshToken } from '@prisma/client';
+import { getPlan } from '../../config/plans';
 import { prisma } from '../../lib/prisma';
 import { runWithTenant, type TenantTx } from '../../lib/tenantContext';
 import { hashPassword, comparePassword } from '../../lib/password';
@@ -90,7 +91,7 @@ interface CreateTenantWithAdminParams {
   // without needing to know about SchoolGroup at all.
   name: string;
   slug: string;
-  plan: TenantPlan;
+  plan: string;
   themeId: string;
   contactEmail?: string;
   contactPhone?: string;
@@ -211,6 +212,15 @@ export async function signup(
     });
   }
 
+  // input.plan used to be validated against a fixed enum at parse time;
+  // plans are now a DB table (config/plans.ts), so existence + active-ness
+  // is checked here instead. Inactive rejects the same as unknown — a
+  // deactivated plan must not be selectable from the public signup form.
+  const selectedPlan = await getPlan(input.plan);
+  if (!selectedPlan || !selectedPlan.active) {
+    throw AppError.badRequest('Selected plan is not available', { field: 'plan' });
+  }
+
   const tenantId = randomUUID();
   const passwordHash = await hashPassword(input.adminPassword);
 
@@ -300,6 +310,12 @@ export async function signupMultiBranch(
     throw AppError.conflict('That school URL is already taken. Please choose another.', {
       field: 'slug',
     });
+  }
+
+  // See signup()'s identical check — plans are a DB table now.
+  const selectedPlan = await getPlan(input.plan);
+  if (!selectedPlan || !selectedPlan.active) {
+    throw AppError.badRequest('Selected plan is not available', { field: 'plan' });
   }
 
   // Derive + reserve every branch's own tenant slug up front, fully

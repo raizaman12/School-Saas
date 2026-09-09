@@ -47,6 +47,9 @@ export default function PlatformTenantsPage() {
       }),
     [page, debouncedSearch, status, plan],
   );
+  // Super Admin's full catalog (including deactivated plans — a school can
+  // still be filtered by one it's on even after it's been deactivated).
+  const { data: plans } = useAsync(() => platformApi.listPlans(), []);
 
   return (
     <div className="flex flex-col gap-4">
@@ -92,10 +95,12 @@ export default function PlatformTenantsPage() {
           className="w-40"
         >
           <option value="">All plans</option>
-          <option value="TRIAL">Trial</option>
-          <option value="BASIC">Basic</option>
-          <option value="STANDARD">Standard</option>
-          <option value="PREMIUM">Premium</option>
+          {plans?.map((p) => (
+            <option key={p.id} value={p.code}>
+              {p.name}
+              {!p.active ? " (deactivated)" : ""}
+            </option>
+          ))}
         </Select>
       </div>
 

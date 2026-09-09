@@ -22,7 +22,11 @@ import {
 export const staffRouter = Router();
 staffRouter.use(requireAuth);
 
-export const READ_ROLES = ['SCHOOL_ADMIN', 'ACCOUNTANT'] as const;
+// FRONT_DESK added for Previous Data → Teachers (see previousData.ts) —
+// front desk staff need to browse terminated/on-leave staff the same way
+// they can already browse students (students.ts's own READ_ROLES already
+// includes FRONT_DESK).
+export const READ_ROLES = ['SCHOOL_ADMIN', 'ACCOUNTANT', 'FRONT_DESK'] as const;
 export const WRITE_ROLES = ['SCHOOL_ADMIN'] as const;
 // Salary is the one field of a staff record an Accountant needs to be able
 // to set without also getting the rest of WRITE_ROLES' full-edit power
@@ -34,6 +38,20 @@ export const SALARY_WRITE_ROLES = ['SCHOOL_ADMIN', 'ACCOUNTANT'] as const;
 // see the DELETE handler's own pre-checks below for exactly what that
 // blocks. Kept to SCHOOL_ADMIN only, same bar as students.
 export const DELETE_ROLES = ['SCHOOL_ADMIN'] as const;
+
+// FRONT_DESK was added to READ_ROLES for Previous Data → Teachers, but
+// salary is a payroll detail front desk staff have no business seeing —
+// redact it from any response FRONT_DESK receives, same idea as
+// sanitizeUser() stripping passwordHash below.
+function redactSalaryIfFrontDesk<T extends { monthlySalary: unknown }>(
+  role: string,
+  staff: T,
+): T | Omit<T, 'monthlySalary'> {
+  if (role !== 'FRONT_DESK') return staff;
+  const redacted = { ...staff } as Partial<T>;
+  delete redacted.monthlySalary;
+  return redacted as Omit<T, 'monthlySalary'>;
+}
 
 function sanitizeUser<T extends { passwordHash: string }>(user: T): Omit<T, 'passwordHash'> {
   const safe = { ...user } as Partial<T>;
@@ -129,25 +147,20 @@ staffRouter.patch('/me', async (req: Request, res: Response) => {
 });
 
 /**
- * Permanently removes a staff member's login and StaffProfile. Deliberately
- * NOT a bare `tx.user.delete()` the way students.ts's DELETE is — a staff
- * member is very often the AUTHOR of other tenant records, not just a
- * subject of them, and several of those relations are `onDelete: Cascade`
- * pointing FROM the other record TO the staff member's User row (Homework,
- * CourseMaterial, Notice, ReportCardBatchJob, StudentLeaveRequest —
- * deleting the User would silently wipe every homework/notice/course
- * material they ever created, for the WHOLE SCHOOL, not just their own
- * data). Those are pre-checked explicitly below and block the delete with
- * a clear message. A handful of other relations (DisciplineRecord,
- * SupportNeed, StudentHealthProfile, HealthLogEntry,
- * StudentCustomFieldValue) are `onDelete: Restrict` — Postgres itself
- * refuses the delete for those, surfaced here as the same clean 409.
- *
- * For a staff member with real history, the correct "remove them" action
- * is PATCH .../:id { status: 'TERMINATED' } (already supported) — this
- * DELETE exists for the case the frontend guides admins toward: undoing a
- * genuine data-entry mistake (added the wrong person, wrong role, etc.)
- * before they've done anything else in the system yet.
+ * "Delete" a staff member. This used to be a real, cascading SQL DELETE —
+ * but ONLY when the staff member had authored nothing (homework, notices,
+ * discipline records, health logs, ...); anyone with real history got a
+ * 409 telling the admin to PATCH status to TERMINATED instead, since a
+ * hard delete really would have destroyed everything they authored (and
+ * a few relations are `onDelete: Restrict`, so Postgres would have
+ * refused it outright anyway). That whole history-count safety net is no
+ * longer needed: "Delete" now ALWAYS does what that 409 message told
+ * admins to do manually — set status to TERMINATED and disable their
+ * login — never a destructive delete, for anyone, with or without
+ * history. Every relation (payroll, leave requests, everything they ever
+ * authored) stays completely intact; the staff member just drops out of
+ * the default (unfiltered) GET / list and shows up under Previous Data →
+ * Teachers instead (see previousData.ts).
  */
 staffRouter.delete('/:id', requireRole(...DELETE_ROLES), async (req: Request, res: Response) => {
   const tenantId = req.auth!.tenantId;
@@ -160,67 +173,25 @@ staffRouter.delete('/:id', requireRole(...DELETE_ROLES), async (req: Request, re
     if (existing.userId === req.auth!.userId) {
       throw AppError.badRequest('You cannot delete your own account.');
     }
+    if (existing.status === 'TERMINATED') return; // already archived — idempotent
 
-    const [
-      adminCount,
-      homeworkCount,
-      courseMaterialCount,
-      noticeCount,
-      reportCardBatchCount,
-      studentLeaveRequestCount,
-      disciplineCount,
-      supportNeedCount,
-      supportNeedReviewCount,
-      healthProfileCount,
-      healthLogCount,
-      customFieldValueCount,
-    ] = await Promise.all([
-      tx.user.count({ where: { role: 'SCHOOL_ADMIN', status: 'ACTIVE' } }),
-      tx.homework.count({ where: { assignedByUserId: existing.userId } }),
-      tx.courseMaterial.count({ where: { uploadedByUserId: existing.userId } }),
-      tx.notice.count({ where: { publishedByUserId: existing.userId } }),
-      tx.reportCardBatchJob.count({ where: { requestedByUserId: existing.userId } }),
-      tx.studentLeaveRequest.count({ where: { requestedByUserId: existing.userId } }),
-      tx.disciplineRecord.count({ where: { reportedByUserId: existing.userId } }),
-      tx.supportNeed.count({ where: { createdByUserId: existing.userId } }),
-      tx.supportNeedReview.count({ where: { reviewedByUserId: existing.userId } }),
-      tx.studentHealthProfile.count({ where: { updatedByUserId: existing.userId } }),
-      tx.healthLogEntry.count({ where: { loggedByUserId: existing.userId } }),
-      tx.studentCustomFieldValue.count({ where: { updatedByUserId: existing.userId } }),
-    ]);
-
-    // A departing/being-deleted SCHOOL_ADMIN must never leave the school
-    // with zero active admins locked out of their own account.
+    // A departing/being-terminated SCHOOL_ADMIN must never leave the
+    // school with zero active admins locked out of their own account.
     const user = await tx.user.findUnique({ where: { id: existing.userId } });
-    if (user?.role === 'SCHOOL_ADMIN' && adminCount <= 1) {
-      throw AppError.badRequest('Cannot delete the school\'s only remaining admin account.');
+    if (user?.role === 'SCHOOL_ADMIN') {
+      const adminCount = await tx.user.count({ where: { role: 'SCHOOL_ADMIN', status: 'ACTIVE' } });
+      if (adminCount <= 1) {
+        throw AppError.badRequest("Cannot remove the school's only remaining admin account.");
+      }
     }
 
-    const blockers: string[] = [];
-    if (homeworkCount > 0) blockers.push(`${homeworkCount} homework assignment(s)`);
-    if (courseMaterialCount > 0) blockers.push(`${courseMaterialCount} course material upload(s)`);
-    if (noticeCount > 0) blockers.push(`${noticeCount} published notice(s)`);
-    if (reportCardBatchCount > 0) blockers.push(`${reportCardBatchCount} report card batch(es)`);
-    if (studentLeaveRequestCount > 0) blockers.push(`${studentLeaveRequestCount} leave request(s) filed`);
-    if (disciplineCount > 0) blockers.push(`${disciplineCount} discipline record(s)`);
-    if (supportNeedCount > 0) blockers.push(`${supportNeedCount} learning-support record(s)`);
-    if (supportNeedReviewCount > 0) blockers.push(`${supportNeedReviewCount} learning-support review(s)`);
-    if (healthProfileCount > 0) blockers.push(`${healthProfileCount} health profile update(s)`);
-    if (healthLogCount > 0) blockers.push(`${healthLogCount} health log entr(y/ies)`);
-    if (customFieldValueCount > 0) blockers.push(`${customFieldValueCount} custom field edit(s)`);
-
-    if (blockers.length > 0) {
-      throw AppError.conflict(
-        `This staff member has ${blockers.join(', ')} on record and cannot be permanently deleted — ` +
-          `set their status to Terminated instead to remove them from active use while keeping this history intact.`,
-        { blockers },
-      );
+    await tx.staffProfile.update({
+      where: { id: staffId },
+      data: { status: 'TERMINATED', leavingDate: new Date() },
+    });
+    if (user) {
+      await tx.user.update({ where: { id: user.id }, data: { status: 'DISABLED' } });
     }
-
-    // StaffProfile.userId -> User is onDelete: Cascade (the reverse of
-    // Student -> User's SetNull), so deleting the User alone removes the
-    // StaffProfile automatically.
-    await tx.user.delete({ where: { id: existing.userId } });
   });
 
   res.status(204).send();
@@ -260,7 +231,10 @@ staffRouter.get('/', requireRole(...READ_ROLES), async (req: Request, res: Respo
     return { data, total };
   });
 
-  res.json({ data: result.data, meta: paginationMeta(query.page, query.limit, result.total) });
+  res.json({
+    data: result.data.map((s) => redactSalaryIfFrontDesk(req.auth!.role, s)),
+    meta: paginationMeta(query.page, query.limit, result.total),
+  });
 });
 
 staffRouter.get('/:id', requireRole(...READ_ROLES), async (req: Request, res: Response) => {
@@ -274,7 +248,7 @@ staffRouter.get('/:id', requireRole(...READ_ROLES), async (req: Request, res: Re
   );
 
   if (!staff) throw AppError.notFound('Staff member not found');
-  res.json({ data: staff });
+  res.json({ data: redactSalaryIfFrontDesk(req.auth!.role, staff) });
 });
 
 staffRouter.post('/', requireRole(...WRITE_ROLES), async (req: Request, res: Response) => {

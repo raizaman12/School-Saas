@@ -9,7 +9,7 @@ import { AppError } from '../../utils/AppError';
 import { uuidParam } from '../../utils/params';
 import { paginationMeta, toSkipTake } from '../../utils/pagination';
 import { listTenantsQuerySchema, updateTenantStatusSchema, updateTenantPlanSchema } from './validation';
-import { PLAN_CATALOG } from '../../config/plans';
+import { getPlan } from '../../config/plans';
 import { checkSmsCredits } from '../../lib/planLimits';
 
 export const platformTenantsRouter = Router();
@@ -58,7 +58,11 @@ platformTenantsRouter.get('/:id', async (req: Request, res: Response) => {
     return { usage: { userCount, studentCount, staffCount }, smsCredits };
   });
 
-  const planDefinition = PLAN_CATALOG[tenant.plan];
+  // A tenant's plan code should always resolve to a real Plan row (deleting
+  // one while any tenant still uses it is blocked — see platform/plans.ts),
+  // but fall back to null-shaped limits rather than crashing this view if
+  // it somehow doesn't, since this endpoint is read-only and diagnostic.
+  const planDefinition = await getPlan(tenant.plan);
 
   res.json({
     data: {
@@ -66,8 +70,10 @@ platformTenantsRouter.get('/:id', async (req: Request, res: Response) => {
       usage: { ...usage, smsCreditsUsedThisMonth: smsCredits.used },
       planDefinition,
       limits: {
-        withinStudentLimit: planDefinition.maxStudents === null || usage.studentCount <= planDefinition.maxStudents,
-        withinStaffLimit: planDefinition.maxStaff === null || usage.staffCount <= planDefinition.maxStaff,
+        withinStudentLimit:
+          !planDefinition || planDefinition.maxStudents === null || usage.studentCount <= planDefinition.maxStudents,
+        withinStaffLimit:
+          !planDefinition || planDefinition.maxStaff === null || usage.staffCount <= planDefinition.maxStaff,
         withinSmsLimit: smsCredits.allowed,
       },
     },
@@ -112,6 +118,15 @@ platformTenantsRouter.patch('/:id/plan', async (req: Request, res: Response) => 
   const tenant = await runWithTenant(null, async (tx) => {
     const existing = await tx.tenant.findUnique({ where: { id: tenantId } });
     if (!existing) throw AppError.notFound('Tenant not found');
+
+    // input.plan used to be validated against a fixed enum at parse time;
+    // now that plans are a DB table, that check moves here. Deliberately
+    // NOT checking `active` here — a deactivated plan is only hidden from
+    // the public signup picker (see auth.service.ts's signup()); a Super
+    // Admin manually assigning a tenant to it (e.g. a grandfathered/custom
+    // deal) is still allowed.
+    const targetPlan = await getPlan(input.plan, tx);
+    if (!targetPlan) throw AppError.badRequest(`Unknown plan "${input.plan}"`);
 
     const updated = await tx.tenant.update({
       where: { id: tenantId },

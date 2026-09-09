@@ -42,8 +42,11 @@ export const signupSchema = z.object({
   // this is informational/self-declared at signup — a Super Admin can
   // always correct it later via PATCH /api/platform/tenants/:id/plan.
   // Defaults to TRIAL (unchanged behavior) when omitted, matching every
-  // signup before a plan-selection step existed.
-  plan: z.enum(['TRIAL', 'BASIC', 'STANDARD', 'PREMIUM']).default('TRIAL'),
+  // signup before a plan-selection step existed. Was a fixed
+  // z.enum(['TRIAL',...]) — plans are now a DB table (config/plans.ts),
+  // so this just accepts any code string; existence + active-ness is
+  // checked against the table in auth.service.ts's signup().
+  plan: z.string().min(1).default('TRIAL'),
 
   // Chosen dashboard/portal accent-color theme (see config/themePresets.ts)
   // — picked at signup, changeable later via PATCH /api/tenant/theme.
@@ -63,7 +66,8 @@ export type SignupInput = z.infer<typeof signupSchema>;
 export const signupMultiBranchSchema = z.object({
   schoolName: z.string().min(2).max(150),
   slug: slugSchema,
-  plan: z.enum(['TRIAL', 'BASIC', 'STANDARD', 'PREMIUM']).default('TRIAL'),
+  // See signupSchema.plan's comment — same DB-backed validation applies.
+  plan: z.string().min(1).default('TRIAL'),
   themeId: z.enum([...THEME_IDS]).default(DEFAULT_THEME_ID),
   branches: z
     .array(

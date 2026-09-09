@@ -1,7 +1,11 @@
 import { api, uploadFile } from "@/lib/api";
 import type { Paginated } from "./types";
 
-export type StudentStatus = "ACTIVE" | "INACTIVE" | "GRADUATED" | "TRANSFERRED_OUT" | "EXPELLED";
+// ARCHIVED is the "an admin removed this record" soft-delete state — set only
+// via studentsApi.remove() (DELETE /:id), never selectable from the normal
+// status-edit dropdown. See dashboard/previous-data for where archived
+// students are browsed back.
+export type StudentStatus = "ACTIVE" | "INACTIVE" | "GRADUATED" | "TRANSFERRED_OUT" | "EXPELLED" | "ARCHIVED";
 export type Gender = "MALE" | "FEMALE" | "OTHER";
 
 export interface StudentListItem {
@@ -146,17 +150,37 @@ export interface BulkImportResult {
 }
 
 export const studentsApi = {
-  list: (params: { page?: number; limit?: number; search?: string; sectionId?: string; status?: StudentStatus }) => {
+  list: (params: {
+    page?: number;
+    limit?: number;
+    search?: string;
+    sectionId?: string;
+    // A single status, or several combined into one query (e.g. Previous
+    // Data's "Left" filter = INACTIVE + GRADUATED + EXPELLED) — the
+    // backend accepts a comma-separated list (see sis/validation.ts).
+    status?: StudentStatus | StudentStatus[];
+  }) => {
+    const { status, ...rest } = params;
     const qs = new URLSearchParams(
-      Object.entries(params).filter(([, v]) => v !== undefined && v !== "") as [string, string][],
-    ).toString();
-    return api.get<Paginated<StudentListItem>>(`/api/students${qs ? `?${qs}` : ""}`);
+      Object.entries(rest).filter(([, v]) => v !== undefined && v !== "") as [string, string][],
+    );
+    if (status && (Array.isArray(status) ? status.length > 0 : true)) {
+      qs.set("status", Array.isArray(status) ? status.join(",") : status);
+    }
+    const qsString = qs.toString();
+    return api.get<Paginated<StudentListItem>>(`/api/students${qsString ? `?${qsString}` : ""}`);
   },
   get: (id: string) => api.get<{ data: StudentDetail }>(`/api/students/${id}`).then((r) => r.data),
   create: (input: CreateStudentInput) =>
     api.post<{ data: StudentDetail; portalLogin: StudentPortalLogin }>("/api/students", input),
   update: (id: string, input: Partial<CreateStudentInput & { status: StudentStatus; photoUrl: string }>) =>
     api.patch<{ data: StudentDetail }>(`/api/students/${id}`, input).then((r) => r.data),
+  /**
+   * Archives the student (status -> ARCHIVED) and disables their portal
+   * login — the record and every relation (fees, attendance, marks,
+   * health, ...) stay completely intact; nothing is destroyed. See
+   * dashboard/previous-data for where archived students are browsed back.
+   */
   remove: (id: string) => api.delete<void>(`/api/students/${id}`),
   /** The logged-in student's own bio-data + family detail — 403 for any other role. */
   me: () => api.get<{ data: StudentMe }>("/api/students/me").then((r) => r.data),

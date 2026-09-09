@@ -586,7 +586,7 @@ describe('Student portal-login email & delete', () => {
     expect(conflict.body.error.details.field).toBe('email');
   });
 
-  it('DELETE removes the student and their linked portal-login user (204), 403 for non-admin, 404 for unknown/cross-tenant', async () => {
+  it('DELETE archives the student and disables their linked portal-login user (204), 403 for non-admin, 404 for unknown/cross-tenant', async () => {
     const { accessToken, tenant } = await signupSchool(app);
     const created = await request(app)
       .post('/api/students')
@@ -623,13 +623,36 @@ describe('Student portal-login email & delete', () => {
       .set(authHeader(accessToken));
     expect(del.status).toBe(204);
 
+    // The record itself stays fully intact (archived, not gone) — findable
+    // directly by id, and via the list endpoint when ARCHIVED is asked for.
     const getAfter = await request(app)
       .get(`/api/students/${created.body.data.id}`)
       .set(authHeader(accessToken));
-    expect(getAfter.status).toBe(404);
+    expect(getAfter.status).toBe(200);
+    expect(getAfter.body.data.status).toBe('ARCHIVED');
 
-    const orphanUser = await prisma.user.findUnique({ where: { id: userId } });
-    expect(orphanUser).toBeNull();
+    const listDefault = await request(app).get('/api/students').set(authHeader(accessToken));
+    expect(listDefault.body.data.map((s: { id: string }) => s.id)).not.toContain(created.body.data.id);
+    const listArchived = await request(app).get('/api/students?status=ARCHIVED').set(authHeader(accessToken));
+    expect(listArchived.body.data.map((s: { id: string }) => s.id)).toContain(created.body.data.id);
+
+    // The linked login is disabled, not deleted — it can no longer sign in,
+    // but the row (and every author reference to it) stays valid. Read via
+    // ownerDb (bypasses RLS) since app.tenant_id isn't set on this raw
+    // client outside of runWithTenant.
+    const disabledUser = await ownerDb.user.findUnique({ where: { id: userId } });
+    expect(disabledUser?.status).toBe('DISABLED');
+
+    const loginAttempt = await request(app)
+      .post('/api/auth/login')
+      .send({ slug: tenant.slug, email: 'to.delete@test-school.test', password: 'irrelevant' });
+    expect(loginAttempt.status).toBe(401);
+
+    // Archiving twice is a harmless no-op, not an error.
+    const delAgain = await request(app)
+      .delete(`/api/students/${created.body.data.id}`)
+      .set(authHeader(accessToken));
+    expect(delAgain.status).toBe(204);
 
     const other = await signupSchool(app, { slug: 'del-other', adminEmail: 'a@del-other.test' });
     const otherStudent = await request(app)
@@ -640,6 +663,44 @@ describe('Student portal-login email & delete', () => {
       .delete(`/api/students/${otherStudent.body.data.id}`)
       .set(authHeader(accessToken));
     expect(crossTenantDelete.status).toBe(404);
+  });
+
+  it('GET /api/students?status=A,B,C combines multiple statuses into one query (Previous Data\'s "Left" filter)', async () => {
+    const { accessToken } = await signupSchool(app);
+    const makeStudent = async (fullName: string) =>
+      (await request(app).post('/api/students').set(authHeader(accessToken)).send({ fullName, gender: 'MALE', dateOfBirth: '2015-01-01' }))
+        .body.data.id;
+
+    const active = await makeStudent('Active Student');
+    const inactive = await makeStudent('Inactive Student');
+    const graduated = await makeStudent('Graduated Student');
+    const expelled = await makeStudent('Expelled Student');
+    const transferred = await makeStudent('Transferred Student');
+
+    await request(app).patch(`/api/students/${inactive}`).set(authHeader(accessToken)).send({ status: 'INACTIVE' });
+    await request(app).patch(`/api/students/${graduated}`).set(authHeader(accessToken)).send({ status: 'GRADUATED' });
+    await request(app).patch(`/api/students/${expelled}`).set(authHeader(accessToken)).send({ status: 'EXPELLED' });
+    await request(app)
+      .patch(`/api/students/${transferred}`)
+      .set(authHeader(accessToken))
+      .send({ status: 'TRANSFERRED_OUT' });
+
+    const left = await request(app)
+      .get('/api/students?status=INACTIVE,GRADUATED,EXPELLED')
+      .set(authHeader(accessToken));
+    expect(left.status).toBe(200);
+    const leftIds = left.body.data.map((s: { id: string }) => s.id);
+    expect(leftIds).toEqual(expect.arrayContaining([inactive, graduated, expelled]));
+    expect(leftIds).not.toContain(active);
+    expect(leftIds).not.toContain(transferred);
+
+    // A single value still behaves exactly like the plain equality filter
+    // every existing caller already relies on.
+    const singleValue = await request(app).get('/api/students?status=TRANSFERRED_OUT').set(authHeader(accessToken));
+    expect(singleValue.body.data.map((s: { id: string }) => s.id)).toEqual([transferred]);
+
+    const badValue = await request(app).get('/api/students?status=NOT_A_REAL_STATUS').set(authHeader(accessToken));
+    expect(badValue.status).toBe(400);
   });
 });
 

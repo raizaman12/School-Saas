@@ -15,6 +15,7 @@ import {
   resetPasswordHandler,
   tenantBySlugHandler,
   resolveSchoolHandler,
+  plansHandler,
 } from './auth.controller';
 
 export const authRouter = Router();
@@ -47,3 +48,6 @@ authRouter.get('/tenant-by-slug/:slug', tenantBySlugHandler);
 // convention (the global rate limiter still applies as a backstop). See
 // resolveSchoolHandler's comment for why this is safe to leave open.
 authRouter.get('/resolve-school/:slug', resolveSchoolHandler);
+// Public — no auth. Feeds the signup page's plan-selection step; only
+// active plans are ever returned (see plansHandler's own comment).
+authRouter.get('/plans', plansHandler);

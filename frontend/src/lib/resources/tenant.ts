@@ -1,5 +1,6 @@
 import { api } from "@/lib/api";
 import type { ResolvedSchool } from "@/lib/auth/types";
+import type { PlanDefinition } from "./platform";
 
 export interface PublicTenant {
   id: string;
@@ -30,6 +31,14 @@ export const tenantApi = {
 
   /** Public, unauthenticated — the full catalog of selectable accent-color themes (signup wizard, settings page). */
   themePresets: () => api.get<{ data: ThemePreset[] }>("/api/tenant/theme-presets").then((r) => r.data),
+
+  /**
+   * Public, unauthenticated — the signup wizard's plan-picker step. Active
+   * plans only (a deactivated plan shouldn't be selectable by a new school,
+   * even though it stays visible to Super Admin and to schools already on
+   * it — see platformApi.listPlans for that admin-only equivalent).
+   */
+  listPlans: () => api.get<{ data: PlanDefinition[] }>("/api/auth/plans").then((r) => r.data),
 
   /** Self-service — SCHOOL_ADMIN changes their own tenant's theme after signup. */
   updateTheme: (themeId: string) =>

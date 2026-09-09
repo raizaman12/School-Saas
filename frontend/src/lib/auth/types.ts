@@ -39,7 +39,11 @@ export interface PlatformLoginInput {
   password: string;
 }
 
-export type TenantPlan = "TRIAL" | "BASIC" | "STANDARD" | "PREMIUM";
+// Was a fixed "TRIAL" | "BASIC" | "STANDARD" | "PREMIUM" union — plans are
+// now a Super Admin-editable DB table (backend's Plan model / config/plans.ts),
+// so any plan `code` string is valid; see platformApi.listPlans() for the
+// current live catalog and PlanDefinition for a plan's full shape.
+export type TenantPlan = string;
 
 export interface SignupInput {
   schoolName: string;

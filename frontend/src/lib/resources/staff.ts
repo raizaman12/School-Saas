@@ -111,11 +111,11 @@ export const staffApi = {
   updateSalary: (id: string, monthlySalary: number) =>
     api.patch<{ data: StaffListItem }>(`/api/staff/${id}/salary`, { monthlySalary }).then((r) => r.data),
   /**
-   * Permanently deletes the staff member's portal login and staff record —
-   * SCHOOL_ADMIN only (see backend DELETE_ROLES). A 409 means this person
-   * authored other tenant records (homework, notices, ...) and can't be
-   * hard-deleted; surface `err.message` to the admin, who should use the
-   * "Terminated" status instead (see the Edit form's Status field).
+   * Archives the staff member (status -> TERMINATED) and disables their
+   * portal login — SCHOOL_ADMIN only (see backend DELETE_ROLES). The
+   * record and every relation it authored (homework, notices, discipline
+   * records, ...) stay completely intact; nothing is destroyed. See
+   * dashboard/previous-data for where archived staff are browsed back.
    */
   remove: (id: string) => api.delete<void>(`/api/staff/${id}`),
 

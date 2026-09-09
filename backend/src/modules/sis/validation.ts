@@ -148,12 +148,45 @@ export const bulkImportStudentRowSchema = z.object({
 });
 export type BulkImportStudentRow = z.infer<typeof bulkImportStudentRowSchema>;
 
+const studentStatusValues = ['ACTIVE', 'INACTIVE', 'GRADUATED', 'TRANSFERRED_OUT', 'EXPELLED', 'ARCHIVED'] as const;
+const studentStatusEnum = z.enum(studentStatusValues);
+
 export const listStudentsQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),
   search: z.string().max(150).optional(),
   sectionId: z.string().uuid().optional(),
-  status: z.enum(['ACTIVE', 'INACTIVE', 'GRADUATED', 'TRANSFERRED_OUT', 'EXPELLED']).optional(),
+  // ARCHIVED included here (but deliberately NOT in updateStudentSchema's
+  // own status enum above) — a student is only ever archived through the
+  // dedicated DELETE /:id endpoint (which also disables their login), never
+  // through an ordinary PATCH. This filter value exists so Previous Data
+  // can ask for exactly the archived ones.
+  //
+  // Accepts a comma-separated list (e.g. "INACTIVE,GRADUATED,EXPELLED") in
+  // addition to a single value — Previous Data → Students' "Left" filter
+  // groups those three statuses into one selectable option, and combining
+  // them server-side keeps that a single paginated query instead of the
+  // frontend merging three separate result pages by hand. A single value
+  // still parses to a one-element array; students.ts's GET / collapses
+  // that back down to a plain equality filter, so every existing
+  // single-status caller sees byte-for-byte the same query it always did.
+  status: z
+    .string()
+    .optional()
+    .transform((raw, ctx) => {
+      if (!raw) return undefined;
+      const values = raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const parsed = values.map((v) => studentStatusEnum.safeParse(v));
+      const firstInvalid = parsed.find((p) => !p.success);
+      if (firstInvalid) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `status must be one of: ${studentStatusValues.join(', ')}` });
+        return z.NEVER;
+      }
+      return parsed.map((p) => (p as { success: true; data: (typeof studentStatusValues)[number] }).data);
+    }),
 });
 
 export const enrollStudentSchema = z.object({

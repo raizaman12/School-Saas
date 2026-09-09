@@ -137,7 +137,7 @@ export default function StaffDetailPage({ params }: { params: Promise<{ id: stri
       await staffApi.remove(id);
       router.push("/dashboard/staff");
     } catch (err) {
-      setDeleteError(err instanceof ApiError ? err.message : "Could not delete this staff member.");
+      setDeleteError(err instanceof ApiError ? err.message : "Could not archive this staff member.");
       throw err; // keeps ConfirmButton's own inline error panel open too
     }
   };
@@ -208,12 +208,12 @@ export default function StaffDetailPage({ params }: { params: Promise<{ id: stri
         </div>
         <div className="flex items-center gap-2">
           <Badge tone={STATUS_TONE[staff.status] ?? "default"}>{staff.status}</Badge>
-          {canDelete && (
+          {canDelete && staff.status !== "TERMINATED" && (
             <ConfirmButton
-              triggerLabel="Delete"
-              confirmLabel="Delete permanently"
-              title="Delete this staff member?"
-              description="This permanently removes their staff record and portal login. This cannot be undone. If they've authored other records (homework, notices, materials, ...), the delete will be blocked — use the Status field above to mark them Terminated instead."
+              triggerLabel="Archive"
+              confirmLabel="Archive staff member"
+              title="Archive this staff member?"
+              description="Their record, and everything they've authored (homework, notices, discipline records, ...), stays completely intact — this only removes them from the regular Staff list (find them again later under Previous Data) and disables their portal login."
               onConfirm={onDelete}
             />
           )}

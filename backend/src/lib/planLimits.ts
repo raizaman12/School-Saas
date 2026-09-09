@@ -1,6 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import { AppError } from '../utils/AppError';
-import { PLAN_CATALOG } from '../config/plans';
+import { getPlan } from '../config/plans';
 
 /**
  * Enforces a tenant's subscription-plan limits at the point of creation.
@@ -22,7 +22,15 @@ async function assertWithinLimit(
   const tenant = await tx.tenant.findUnique({ where: { id: tenantId }, select: { plan: true } });
   if (!tenant) return; // unreachable in practice — we're already inside this tenant's transaction
 
-  const plan = PLAN_CATALOG[tenant.plan];
+  // A tenant's plan code can only ever go missing from the plans table if
+  // the Plan row itself was deleted — which platform/plans.ts's DELETE
+  // handler already blocks while any tenant is still on that code — so
+  // this is a defensive, should-never-happen guard, not a normal path.
+  const plan = await getPlan(tenant.plan, tx);
+  // Not an AppError on purpose — this is a data-integrity bug (the plan row
+  // vanished under a tenant still assigned to it), not a normal/expected
+  // failure, so it should surface as an unexpected 500, not a clean 4xx.
+  if (!plan) throw new Error(`Tenant's plan "${tenant.plan}" no longer exists in the plans table`);
   const limit = plan[limitKey];
   if (limit === null) return; // unlimited on this tier
 
@@ -68,7 +76,8 @@ export async function checkSmsCredits(
   tenantId: string,
 ): Promise<{ allowed: boolean; used: number; limit: number | null }> {
   const tenant = await tx.tenant.findUnique({ where: { id: tenantId }, select: { plan: true } });
-  const limit = tenant ? PLAN_CATALOG[tenant.plan].maxSmsCreditsPerMonth : 0;
+  const plan = tenant ? await getPlan(tenant.plan, tx) : null;
+  const limit = plan ? plan.maxSmsCreditsPerMonth : 0;
   if (limit === null) return { allowed: true, used: 0, limit: null };
 
   const startOfMonth = new Date();

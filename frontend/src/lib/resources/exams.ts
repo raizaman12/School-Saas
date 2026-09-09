@@ -147,10 +147,20 @@ export const examsApi = {
     api.post<{ data: ExamSubject }>(`/api/exams/subjects/${examSubjectId}/unsubmit`).then((r) => r.data),
   submissionStatus: (examId: string) =>
     api.get<{ data: SubmissionStatusRow[] }>(`/api/exams/${examId}/submission-status`).then((r) => r.data),
-  sectionResults: (examId: string, sectionId: string) =>
-    api
-      .get<{ data: SectionExamResultRow[] }>(`/api/exams/${examId}/results?${new URLSearchParams({ sectionId })}`)
-      .then((r) => r.data),
+  /**
+   * `historical: true` (Previous Data → Results) resolves the roster from
+   * that year's Enrollment records instead of each student's *current*
+   * section/status — so a student who has since been promoted,
+   * transferred, or archived still shows up in a past exam's results. The
+   * live "Generate Result" flow and report cards never pass this.
+   */
+  sectionResults: (examId: string, sectionId: string, opts: { historical?: boolean } = {}) => {
+    const params: Record<string, string> = { sectionId };
+    if (opts.historical) params.historical = "true";
+    return api
+      .get<{ data: SectionExamResultRow[] }>(`/api/exams/${examId}/results?${new URLSearchParams(params)}`)
+      .then((r) => r.data);
+  },
 
   listSubjects: (examId: string, sectionId?: string) => {
     const qs = sectionId ? `?sectionId=${sectionId}` : "";

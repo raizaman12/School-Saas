@@ -31,6 +31,7 @@ export const strings = {
       supportNeeds: "Learning Support",
       health: "Health",
       customFields: "Custom Fields",
+      previousData: "Previous Data",
       leaveRequests: "Leave requests",
       portal: "Parent/Student Portal",
       platformOverview: "Overview",

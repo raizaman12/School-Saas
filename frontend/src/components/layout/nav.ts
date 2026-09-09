@@ -23,6 +23,7 @@ import {
   LineChart,
   ListPlus,
   Contact,
+  Archive,
 } from "lucide-react";
 import type { UserRole } from "@/lib/auth/types";
 import { t } from "@/lib/i18n";
@@ -154,6 +155,15 @@ export const NAV_ITEMS: NavItem[] = [
     // custom-field values reads them straight from the student page, not
     // from here.
     roles: ["SCHOOL_ADMIN"],
+  },
+  {
+    label: t("nav.previousData"),
+    href: "/dashboard/previous-data",
+    icon: Archive,
+    // Browse-only: students/staff who left, were transferred, or were
+    // archived, plus past academic years' exam results — matches the
+    // Students/Staff/Exams READ_ROLES this page's tabs actually call.
+    roles: ["SCHOOL_ADMIN", "FRONT_DESK"],
   },
   { label: t("nav.settings"), href: "/dashboard/settings", icon: Settings, roles: ["SCHOOL_ADMIN"] },
   {

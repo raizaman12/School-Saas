@@ -69,7 +69,7 @@ async function renderPage() {
   });
 }
 
-describe("StaffDetailPage — delete", () => {
+describe("StaffDetailPage — archive", () => {
   beforeEach(() => {
     getMock.mockReset();
     removeMock.mockReset();
@@ -80,47 +80,58 @@ describe("StaffDetailPage — delete", () => {
     mockRole = "SCHOOL_ADMIN";
   });
 
-  it("shows a Delete button to SCHOOL_ADMIN and redirects to the staff list on confirm", async () => {
+  it("shows an Archive button to SCHOOL_ADMIN and redirects to the staff list on confirm", async () => {
     getMock.mockResolvedValue(staff);
     removeMock.mockResolvedValue(undefined);
     const user = userEvent.setup();
     await renderPage();
 
     expect(await screen.findByRole("heading", { name: "Bilal Ahmed" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Delete" }));
-    await user.click(screen.getByRole("button", { name: "Delete permanently" }));
+    await user.click(screen.getByRole("button", { name: "Archive" }));
+    await user.click(screen.getByRole("button", { name: "Archive staff member" }));
 
     await waitFor(() => expect(removeMock).toHaveBeenCalledWith("s1"));
     await waitFor(() => expect(pushMock).toHaveBeenCalledWith("/dashboard/staff"));
   });
 
-  it("surfaces the backend's 409 authored-records-blocker message instead of a generic error", async () => {
+  // Archiving never cascades, so the old "blocked because they authored
+  // other records" 409 no longer happens — the remaining backend refusals
+  // are things like the last-admin guard, surfaced the same generic way.
+  it("surfaces the backend's error message instead of a generic one", async () => {
     const { ApiError } = await import("@/lib/api");
     getMock.mockResolvedValue(staff);
     removeMock.mockRejectedValue(
-      new ApiError(409, {
-        code: "CONFLICT",
-        message: "This staff member has authored 3 homework record(s) and cannot be permanently deleted",
+      new ApiError(400, {
+        code: "BAD_REQUEST",
+        message: "Cannot remove the school's only remaining admin account.",
       }),
     );
     const user = userEvent.setup();
     await renderPage();
 
     await screen.findByRole("heading", { name: "Bilal Ahmed" });
-    await user.click(screen.getByRole("button", { name: "Delete" }));
-    await user.click(screen.getByRole("button", { name: "Delete permanently" }));
+    await user.click(screen.getByRole("button", { name: "Archive" }));
+    await user.click(screen.getByRole("button", { name: "Archive staff member" }));
 
-    expect((await screen.findAllByText(/cannot be permanently deleted/)).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText(/only remaining admin account/)).length).toBeGreaterThan(0);
     expect(pushMock).not.toHaveBeenCalled();
   });
 
-  it("hides the Delete button from a non-SCHOOL_ADMIN role", async () => {
+  it("hides the Archive button from a non-SCHOOL_ADMIN role", async () => {
     mockRole = "ACCOUNTANT";
     getMock.mockResolvedValue(staff);
     await renderPage();
 
     await screen.findByRole("heading", { name: "Bilal Ahmed" });
-    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Archive" })).not.toBeInTheDocument();
+  });
+
+  it("hides the Archive button once the staff member is already TERMINATED", async () => {
+    getMock.mockResolvedValue({ ...staff, status: "TERMINATED" });
+    await renderPage();
+
+    await screen.findByRole("heading", { name: "Bilal Ahmed" });
+    expect(screen.queryByRole("button", { name: "Archive" })).not.toBeInTheDocument();
   });
 
   // Real gap this covers: the Edit button had no role gate at all (unlike

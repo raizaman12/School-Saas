@@ -564,7 +564,11 @@ export default function StudentDetailPage({ params }: { params: Promise<{ id: st
   } = useForm<EditProfileFormValues>({ resolver: zodResolver(editProfileSchema) });
 
   const openEditForm = () => {
-    if (!student) return;
+    // The trigger button is already hidden once ARCHIVED (see canEdit's
+    // usage below) — this guard just keeps the status field's type honest,
+    // since editProfileSchema's status enum deliberately has no ARCHIVED
+    // option to reset the form into.
+    if (!student || student.status === "ARCHIVED") return;
     resetEdit({
       fullName: student.fullName,
       gender: student.gender,
@@ -641,7 +645,7 @@ export default function StudentDetailPage({ params }: { params: Promise<{ id: st
       await studentsApi.remove(id);
       router.push("/dashboard/students");
     } catch (err) {
-      setDeleteError(err instanceof ApiError ? err.message : "Could not delete student.");
+      setDeleteError(err instanceof ApiError ? err.message : "Could not archive student.");
       throw err;
     }
   };
@@ -887,17 +891,19 @@ export default function StudentDetailPage({ params }: { params: Promise<{ id: st
           <p className="text-sm text-slate-500">{student.studentCode}</p>
         </div>
         <div className="flex items-center gap-2">
-          <Badge tone={student.status === "ACTIVE" ? "success" : "default"}>{student.status}</Badge>
+          <Badge tone={student.status === "ACTIVE" ? "success" : student.status === "ARCHIVED" ? "danger" : "default"}>
+            {student.status}
+          </Badge>
           <Button variant="outline" size="sm" onClick={printAdmissionForm} isLoading={isPrintingAdmissionForm}>
             <FileDown className="size-4" aria-hidden="true" />
             Admission form
           </Button>
-          {canDelete && (
+          {canDelete && student.status !== "ARCHIVED" && (
             <ConfirmButton
-              triggerLabel="Delete"
-              confirmLabel="Delete permanently"
-              title="Delete this student?"
-              description="This permanently removes the student's profile, attendance, fee, exam, homework, discipline, learning-support, and health records, and their portal login if any. This cannot be undone."
+              triggerLabel="Archive"
+              confirmLabel="Archive student"
+              title="Archive this student?"
+              description="Their profile, attendance, fee, exam, homework, discipline, learning-support, and health records all stay intact — this only removes them from the regular Students list (find them again later under Previous Data) and disables their portal login."
               onConfirm={onDelete}
             />
           )}
@@ -911,7 +917,12 @@ export default function StudentDetailPage({ params }: { params: Promise<{ id: st
         <Card className="lg:col-span-2">
           <CardHeader className="flex-row items-center justify-between space-y-0">
             <CardTitle>Profile</CardTitle>
-            {canEdit && !showEditForm && (
+            {/* Archived is only reachable via the dedicated archive action
+                above (Previous Data browses these read-only) — the edit
+                form's own status dropdown deliberately has no ARCHIVED
+                option to switch back to, matching the backend's
+                updateStudentSchema. */}
+            {canEdit && !showEditForm && student.status !== "ARCHIVED" && (
               <Button size="sm" variant="outline" onClick={openEditForm}>
                 <Pencil className="size-4" aria-hidden="true" />
                 Edit

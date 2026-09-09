@@ -24,11 +24,35 @@ enum TenantStatus {
   CANCELLED
 }
 
-enum TenantPlan {
-  TRIAL
-  BASIC
-  STANDARD
-  PREMIUM
+// Subscription tier catalog. This used to be a fixed Prisma enum
+// (TenantPlan: TRIAL/BASIC/STANDARD/PREMIUM) with the tier details in a
+// static TS config (config/plans.ts's PLAN_CATALOG). It's now a real table
+// so a Super Admin can add/edit/deactivate/delete tiers at runtime. Tenant.plan
+// stays a plain string matching Plan.code (not a UUID foreign key) so every
+// tenant row already in production (plan = 'TRIAL'/'BASIC'/...) keeps working
+// untouched across the migration — only the *lookup* of what a code means
+// moves from a TS object to this table. See config/plans.ts's getPlan()/listPlans().
+model Plan {
+  id   String @id @default(uuid()) @db.Uuid
+  code String @unique // e.g. "TRIAL" — matches Tenant.plan
+
+  name                  String
+  priceMonthlyPKR       Int
+  maxStudents           Int? // null = unlimited
+  maxStaff              Int?
+  maxSmsCreditsPerMonth Int? // null = unlimited, 0 = not available on this tier
+  features              Json // string[]
+
+  // Soft-disable, same pattern as CustomFieldDefinition.active: hides from
+  // the public signup plan picker and the "assign plan" picker, but leaves
+  // any tenant already on this plan completely unaffected.
+  active    Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("plans")
 }
 
 model Tenant {
@@ -37,7 +61,10 @@ model Tenant {
   // subdomain / slug used for tenant resolution (e.g. citymodelschool.ourapp.com)
   slug   String       @unique
   status TenantStatus @default(TRIAL)
-  plan   TenantPlan   @default(TRIAL)
+  // References Plan.code (see comment on Plan above), not a DB-enforced FK —
+  // kept a plain string deliberately so this migration didn't need to
+  // backfill/rewrite every existing tenant row.
+  plan   String       @default("TRIAL")
 
   // Multi-branch schools: set only when this tenant is one branch of a
   // SchoolGroup (see model below) — a fully independent Tenant in every
@@ -478,6 +505,13 @@ enum StudentStatus {
   GRADUATED
   TRANSFERRED_OUT
   EXPELLED
+  // Set when an admin "deletes" a student from the UI. This used to be a
+  // real, cascading SQL DELETE (fees/marks/attendance/health records — all
+  // gone forever, no recovery). It's now a soft-delete: the row and every
+  // relation stay intact, the student just drops out of active lists and
+  // shows up under Previous Data → Students instead. See sis/students.ts's
+  // DELETE handler.
+  ARCHIVED
 }
 
 model Student {

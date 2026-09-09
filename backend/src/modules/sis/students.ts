@@ -27,9 +27,10 @@ studentsRouter.use(requireAuth);
 
 const READ_ROLES = ['SCHOOL_ADMIN', 'FRONT_DESK', 'TEACHER', 'ACCOUNTANT'] as const;
 const WRITE_ROLES = ['SCHOOL_ADMIN', 'FRONT_DESK'] as const;
-// Deleting a student cascades to every attendance/fee/exam/homework record
-// tied to them (see the Cascade FKs in schema.prisma) — irreversible, so
-// it's restricted more tightly than ordinary edits.
+// "Delete" archives the student (status -> ARCHIVED, login disabled) rather
+// than destroying the row — see the DELETE handler below — but is still
+// restricted to SCHOOL_ADMIN, matching every other admin-only removal
+// action in this app (e.g. staff's own DELETE).
 const DELETE_ROLES = ['SCHOOL_ADMIN'] as const;
 
 /**
@@ -140,7 +141,22 @@ studentsRouter.get('/', requireRole(...READ_ROLES), async (req: Request, res: Re
     }
 
     const where: Prisma.StudentWhereInput = {
-      ...(query.status ? { status: query.status } : {}),
+      // No explicit status filter -> everything except ARCHIVED (matches
+      // this endpoint's existing behavior of showing every OTHER status —
+      // TRANSFERRED_OUT/GRADUATED/EXPELLED/INACTIVE — unfiltered by
+      // default; ARCHIVED is the one exception, since it's what "Delete"
+      // now does and a deleted record reappearing in the normal list by
+      // default would look like deletion silently failed. Previous Data
+      // is where ARCHIVED students are meant to be found — it passes
+      // status=ARCHIVED explicitly. query.status is already a parsed
+      // array (validation.ts splits a comma-separated value) — a single
+      // value collapses to a plain equality filter so every existing
+      // caller's query is unchanged.
+      ...(query.status
+        ? query.status.length === 1
+          ? { status: query.status[0] }
+          : { status: { in: query.status } }
+        : { status: { not: 'ARCHIVED' } }),
       ...(query.sectionId
         ? { currentSectionId: query.sectionId }
         : allowedSectionIds
@@ -535,6 +551,18 @@ studentsRouter.patch('/:id', requireRole(...WRITE_ROLES), async (req: Request, r
   res.json({ data: updated });
 });
 
+/**
+ * "Delete" a student. This used to be a real, cascading SQL DELETE — every
+ * attendance/fee/exam/homework/health/custom-field record tied to the
+ * student was destroyed along with it, irreversibly, with nothing left to
+ * ever look up again. It's now a soft-delete/archive: the student row and
+ * every relation stay completely intact, the student's login (if any) is
+ * disabled so they can no longer sign in, and status flips to ARCHIVED —
+ * which drops them out of the default (unfiltered) GET / list and surfaces
+ * them instead under Previous Data → Students (see previousData.ts).
+ * Reversible in principle (an admin could PATCH status back), though no UI
+ * for that exists yet.
+ */
 studentsRouter.delete('/:id', requireRole(...DELETE_ROLES), async (req: Request, res: Response) => {
   const tenantId = req.auth!.tenantId;
   const studentId = uuidParam(req, 'id');
@@ -542,22 +570,16 @@ studentsRouter.delete('/:id', requireRole(...DELETE_ROLES), async (req: Request,
   await runWithTenant(tenantId, async (tx) => {
     const existing = await tx.student.findUnique({ where: { id: studentId } });
     if (!existing) throw AppError.notFound('Student not found');
+    if (existing.status === 'ARCHIVED') return; // already archived — idempotent
 
-    // Student -> User is onDelete: SetNull (not Cascade — deleting a login
-    // shouldn't take the whole student record with it), so the reverse
-    // isn't automatic either: deleting the student alone would leave an
-    // orphaned, still-loggable-in portal account behind. Remove the login
-    // explicitly first.
+    // Block sign-in without destroying the login row itself (Student.userId
+    // still points at it — needed for the student's own audit trail, e.g.
+    // customFieldValue.updatedByUserId, marksEnteredBy, etc. elsewhere).
     if (existing.userId) {
-      await tx.user.delete({ where: { id: existing.userId } });
+      await tx.user.update({ where: { id: existing.userId }, data: { status: 'DISABLED' } });
     }
 
-    // Cascades to enrollments, attendance, invoices/payments, exam marks,
-    // homework submissions, discipline records, learning support plans,
-    // health profile/log entries, custom field values, elective-subject
-    // enrollments, and guardian links — see the onDelete: Cascade FKs
-    // pointing at Student in schema.prisma. Irreversible.
-    await tx.student.delete({ where: { id: studentId } });
+    await tx.student.update({ where: { id: studentId }, data: { status: 'ARCHIVED' } });
   });
 
   res.status(204).send();

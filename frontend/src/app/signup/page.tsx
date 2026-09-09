@@ -11,24 +11,34 @@ import { ApiError } from "@/lib/api";
 import {
   signupSchema,
   signupMultiBranchSchema,
-  PLAN_OPTIONS,
   type SignupFormValues,
   type SignupMultiBranchFormValues,
 } from "@/lib/auth/schemas";
 import type { TenantPlan, SignupMultiBranchResult } from "@/lib/auth/types";
 import { tenantApi, type ThemePreset } from "@/lib/resources/tenant";
+import type { PlanDefinition } from "@/lib/resources/platform";
 import { applyPrimaryTheme } from "@/lib/theme";
 import { useAsync } from "@/lib/hooks/useAsync";
 import { ThemePicker } from "@/components/domain/ThemePicker";
 import { Button, Input, Alert, Badge, Spinner } from "@/components/ui";
 import { t } from "@/lib/i18n";
 
-const PLAN_HIGHLIGHTS: Record<TenantPlan, string> = {
-  TRIAL: "Up to 50 students, 10 staff. No SMS/WhatsApp.",
-  BASIC: "Up to 300 students, 30 staff. No SMS/WhatsApp.",
-  STANDARD: "Up to 1,000 students, 100 staff, 1,000 SMS/WhatsApp sends a month.",
-  PREMIUM: "Unlimited students, staff, and SMS/WhatsApp.",
-};
+/** e.g. "Up to 1,000 students, 100 staff, 1,000 SMS/WhatsApp sends a month." */
+function planHighlight(plan: PlanDefinition): string {
+  const students = plan.maxStudents === null ? "Unlimited students" : `Up to ${plan.maxStudents.toLocaleString()} students`;
+  const staff = plan.maxStaff === null ? "unlimited staff" : `${plan.maxStaff.toLocaleString()} staff`;
+  const sms =
+    plan.maxSmsCreditsPerMonth === null
+      ? "unlimited SMS/WhatsApp"
+      : plan.maxSmsCreditsPerMonth === 0
+        ? "no SMS/WhatsApp"
+        : `${plan.maxSmsCreditsPerMonth.toLocaleString()} SMS/WhatsApp sends a month`;
+  return `${students}, ${staff}. ${sms.charAt(0).toUpperCase() + sms.slice(1)}.`;
+}
+
+function planPriceLabel(plan: PlanDefinition): string {
+  return plan.priceMonthlyPKR === 0 ? "Free" : `Rs ${plan.priceMonthlyPKR.toLocaleString()}/mo`;
+}
 
 const DEFAULT_THEME_ID = "navy-blue";
 
@@ -38,7 +48,27 @@ function emptyBranch() {
   return { branchName: "", city: "", adminFullName: "", adminEmail: "", adminPassword: "" };
 }
 
-function PlanStep({ selected, onSelect, onContinue }: { selected: TenantPlan; onSelect: (p: TenantPlan) => void; onContinue: () => void }) {
+function PlanStep({
+  selected,
+  onSelect,
+  onContinue,
+}: {
+  selected: TenantPlan;
+  onSelect: (p: TenantPlan) => void;
+  onContinue: () => void;
+}) {
+  const { data: plans, isLoading, error } = useAsync(() => tenantApi.listPlans(), []);
+
+  // Once the catalog loads, default to the first (lowest sortOrder — usually
+  // the free/trial tier) plan if nothing is selected yet, so the Continue
+  // button always has a valid, existing plan behind it.
+  useEffect(() => {
+    if (plans && plans.length > 0 && !plans.some((p) => p.code === selected)) {
+      onSelect(plans[0].code);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plans]);
+
   return (
     <div className="flex flex-col gap-4">
       <div className="text-center">
@@ -46,33 +76,38 @@ function PlanStep({ selected, onSelect, onContinue }: { selected: TenantPlan; on
         <p className="mt-1 text-sm text-slate-500">{t("auth.choosePlanSubtitle")}</p>
       </div>
 
+      {isLoading && <Spinner label="Loading plans" />}
+      {error && <Alert tone="danger">Couldn&apos;t load plans right now — please refresh and try again.</Alert>}
+
       <div className="flex flex-col gap-2">
-        {PLAN_OPTIONS.map((plan) => {
-          const isSelected = selected === plan.value;
+        {plans?.map((plan) => {
+          const isSelected = selected === plan.code;
           return (
             <button
-              key={plan.value}
+              key={plan.id}
               type="button"
-              onClick={() => onSelect(plan.value)}
+              onClick={() => onSelect(plan.code)}
               className={`flex flex-col gap-1 rounded-xl border p-4 text-left transition-colors ${
                 isSelected ? "border-primary-500 bg-primary-50 ring-1 ring-primary-500" : "border-slate-200 bg-white hover:border-slate-300"
               }`}
             >
               <div className="flex items-center justify-between">
-                <span className="font-semibold text-slate-900">{plan.label}</span>
+                <span className="font-semibold text-slate-900">
+                  {plan.name} — {planPriceLabel(plan)}
+                </span>
                 {isSelected && (
                   <Badge tone="info">
                     <Check className="size-3.5" aria-hidden="true" />
                   </Badge>
                 )}
               </div>
-              <span className="text-sm text-slate-500">{PLAN_HIGHLIGHTS[plan.value]}</span>
+              <span className="text-sm text-slate-500">{planHighlight(plan)}</span>
             </button>
           );
         })}
       </div>
 
-      <Button type="button" onClick={onContinue} className="mt-2 w-full">
+      <Button type="button" onClick={onContinue} disabled={!selected} className="mt-2 w-full">
         {t("auth.continueButton")}
       </Button>
     </div>
@@ -228,7 +263,12 @@ function DetailsStep({
     }
   };
 
-  const planLabel = PLAN_OPTIONS.find((p) => p.value === plan)?.label ?? plan;
+  // Re-fetches the same small public catalog PlanStep just loaded, purely to
+  // resolve the chosen code to a display name for this confirmation banner —
+  // cheap and unauthenticated, so a second call here is simpler than lifting
+  // the list up through the wizard's step state.
+  const { data: plans } = useAsync(() => tenantApi.listPlans(), []);
+  const planLabel = plans?.find((p) => p.code === plan)?.name ?? plan;
 
   return (
     <div className="flex flex-col gap-4">
@@ -487,7 +527,10 @@ function MultiSuccessStep({ result }: { result: SignupMultiBranchResult }) {
 
 export default function SignupPage() {
   const [step, setStep] = useState<"plan" | "theme" | "mode" | "details" | "multiBranch" | "multiSuccess">("plan");
-  const [plan, setPlan] = useState<TenantPlan>("TRIAL");
+  // Populated once PlanStep's fetch resolves (see its effect) — starts empty
+  // rather than a hardcoded "TRIAL" since the actual catalog, and which plan
+  // sorts first, is now Super Admin-editable.
+  const [plan, setPlan] = useState<TenantPlan>("");
   const [themeId, setThemeId] = useState<string>(DEFAULT_THEME_ID);
   const [mode, setMode] = useState<SignupMode>("single");
   const [multiResult, setMultiResult] = useState<SignupMultiBranchResult | null>(null);

@@ -23,6 +23,56 @@ const themePresetsMock = vi.fn().mockResolvedValue([
   { id: "bottle-green", label: "Bottle Green", primaryHex: "#065f46" },
   { id: "maroon", label: "Maroon", primaryHex: "#7f1d1d" },
 ]);
+const listPlansMock = vi.fn().mockResolvedValue([
+  {
+    id: "plan-trial",
+    code: "TRIAL",
+    name: "Trial",
+    priceMonthlyPKR: 0,
+    maxStudents: 50,
+    maxStaff: 10,
+    maxSmsCreditsPerMonth: 0,
+    features: ["Core SIS", "Attendance", "Basic fee management", "14-day trial"],
+    active: true,
+    sortOrder: 0,
+  },
+  {
+    id: "plan-basic",
+    code: "BASIC",
+    name: "Basic",
+    priceMonthlyPKR: 5000,
+    maxStudents: 300,
+    maxStaff: 30,
+    maxSmsCreditsPerMonth: 0,
+    features: ["Core SIS", "Attendance", "Fee management", "Exams & report cards"],
+    active: true,
+    sortOrder: 1,
+  },
+  {
+    id: "plan-standard",
+    code: "STANDARD",
+    name: "Standard",
+    priceMonthlyPKR: 12000,
+    maxStudents: 1000,
+    maxStaff: 100,
+    maxSmsCreditsPerMonth: 1000,
+    features: ["Everything in Basic", "HR & payroll", "SMS/WhatsApp notifications (1000/mo)", "Parent portal"],
+    active: true,
+    sortOrder: 2,
+  },
+  {
+    id: "plan-premium",
+    code: "PREMIUM",
+    name: "Premium",
+    priceMonthlyPKR: 25000,
+    maxStudents: null,
+    maxStaff: null,
+    maxSmsCreditsPerMonth: null,
+    features: ["Everything in Standard", "Unlimited students & staff", "Unlimited SMS/WhatsApp", "Priority support"],
+    active: true,
+    sortOrder: 3,
+  },
+]);
 
 vi.mock("@/lib/auth/AuthProvider", () => ({
   useAuth: () => ({ signup: signupMock, signupMultiBranch: signupMultiBranchMock }),
@@ -33,12 +83,22 @@ vi.mock("next/navigation", () => ({
 }));
 
 vi.mock("@/lib/resources/tenant", () => ({
-  tenantApi: { themePresets: () => themePresetsMock() },
+  tenantApi: { themePresets: () => themePresetsMock(), listPlans: () => listPlansMock() },
 }));
 
 async function continueThroughThemeStep(user: ReturnType<typeof userEvent.setup>) {
   // Step 2: theme selection — wait for the swatch grid to load, then move on.
   await waitFor(() => expect(screen.getByRole("button", { name: "Bottle Green" })).toBeInTheDocument());
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+}
+
+// Step 1: plan selection — PlanStep now fetches its catalog from the (mocked)
+// API, so wait for it to render before interacting. With no `pick`, this
+// leaves the auto-selected first plan (Trial, per listPlansMock's sortOrder)
+// in place, matching the old hardcoded default.
+async function continueThroughPlanStep(user: ReturnType<typeof userEvent.setup>, pick?: RegExp) {
+  await waitFor(() => expect(screen.getByRole("button", { name: /Trial/ })).toBeInTheDocument());
+  if (pick) await user.click(screen.getByRole("button", { name: pick }));
   await user.click(screen.getByRole("button", { name: "Continue" }));
 }
 
@@ -57,6 +117,7 @@ describe("SignupPage", () => {
     signupMultiBranchMock.mockClear();
     pushMock.mockClear();
     themePresetsMock.mockClear();
+    listPlansMock.mockClear();
   });
 
   it("carries the plan and theme chosen in earlier steps through to the submitted signup payload", async () => {
@@ -64,8 +125,7 @@ describe("SignupPage", () => {
     render(<SignupPage />);
 
     // Step 1: plan selection — pick Standard instead of the default Trial.
-    await user.click(screen.getByRole("button", { name: /Standard/ }));
-    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await continueThroughPlanStep(user, /Standard/);
 
     // Step 2: theme selection — pick Bottle Green instead of the default Navy Blue.
     await waitFor(() => expect(screen.getByRole("button", { name: "Bottle Green" })).toBeInTheDocument());
@@ -98,7 +158,7 @@ describe("SignupPage", () => {
     const user = userEvent.setup();
     render(<SignupPage />);
 
-    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await continueThroughPlanStep(user);
     await continueThroughThemeStep(user);
     await continueThroughModeStep(user);
 
@@ -116,7 +176,7 @@ describe("SignupPage", () => {
     const user = userEvent.setup();
     render(<SignupPage />);
 
-    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await continueThroughPlanStep(user);
     await continueThroughThemeStep(user);
 
     await waitFor(() => expect(screen.getByRole("button", { name: /Multiple branches/ })).toBeInTheDocument());
@@ -133,7 +193,7 @@ describe("SignupPage", () => {
     const user = userEvent.setup();
     render(<SignupPage />);
 
-    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await continueThroughPlanStep(user);
     await continueThroughThemeStep(user);
 
     await waitFor(() => expect(screen.getByRole("button", { name: /Multiple branches/ })).toBeInTheDocument());
@@ -193,7 +253,7 @@ describe("SignupPage", () => {
     const user = userEvent.setup();
     render(<SignupPage />);
 
-    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await continueThroughPlanStep(user);
     await continueThroughThemeStep(user);
     await waitFor(() => expect(screen.getByRole("button", { name: /Multiple branches/ })).toBeInTheDocument());
     await user.click(screen.getByRole("button", { name: /Multiple branches/ }));

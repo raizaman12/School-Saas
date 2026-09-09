@@ -424,13 +424,63 @@ examsRouter.get(
  * admin's per-section results list below and buildReportCard's own
  * "Position: X of Y" summary field, so both always agree.
  */
-async function computeSectionExamResults(tx: Prisma.TransactionClient, examId: string, sectionId: string) {
-  const [examSubjects, students, gradingBands] = await Promise.all([
+type ResultRosterStudent = { id: string; studentCode: string; fullName: string };
+
+/**
+ * The live roster: whoever is CURRENTLY active in this section, right now.
+ * Correct for the everyday "Generate Result" flow (this exam's own
+ * section, viewed shortly after it happened) but wrong for a *past* exam
+ * viewed later — a student who has since been promoted, transferred, or
+ * archived would silently vanish from their own historical result. See
+ * resolveHistoricalRoster below for the Previous Data variant.
+ */
+function resolveActiveRoster(tx: Prisma.TransactionClient, sectionId: string): Promise<ResultRosterStudent[]> {
+  return tx.student.findMany({
+    where: { currentSectionId: sectionId, status: 'ACTIVE' },
+    orderBy: { fullName: 'asc' },
+    select: { id: true, studentCode: true, fullName: true },
+  });
+}
+
+/**
+ * The historical roster: whoever was actually enrolled in this section for
+ * this exam's academic year, per the Enrollment table (schema.prisma's own
+ * "Historical record of which section a student belonged to, per academic
+ * year") — regardless of where that student is, or what their status is,
+ * TODAY. This is what Previous Data → Results uses so an exam from 2 years
+ * ago still shows everyone who actually sat it, including students who
+ * have since transferred out, graduated, or been archived.
+ */
+async function resolveHistoricalRoster(
+  tx: Prisma.TransactionClient,
+  sectionId: string,
+  academicYearId: string,
+): Promise<ResultRosterStudent[]> {
+  const enrollments = await tx.enrollment.findMany({
+    where: { sectionId, academicYearId },
+    include: { student: { select: { id: true, studentCode: true, fullName: true } } },
+  });
+  return enrollments.map((e) => e.student).sort((a, b) => a.fullName.localeCompare(b.fullName));
+}
+
+/**
+ * Shared ranking/grading math, factored out so the live roster
+ * (resolveActiveRoster) and the historical roster (resolveHistoricalRoster)
+ * compute results identically — the only thing that ever differs between
+ * "today's results" and "Previous Data → Results" is which students are in
+ * `students`, never how a result is scored.
+ */
+async function computeExamResultsForRoster(
+  tx: Prisma.TransactionClient,
+  examId: string,
+  sectionId: string,
+  students: ResultRosterStudent[],
+) {
+  const [examSubjects, gradingBands] = await Promise.all([
     tx.examSubject.findMany({
       where: { examId, sectionSubject: { sectionId } },
       include: { sectionSubject: true },
     }),
-    tx.student.findMany({ where: { currentSectionId: sectionId, status: 'ACTIVE' }, orderBy: { fullName: 'asc' } }),
     tx.gradingBand.findMany({ orderBy: { sortOrder: 'asc' } }),
   ]);
   const bands = gradingBands.length
@@ -505,20 +555,47 @@ async function computeSectionExamResults(tx: Prisma.TransactionClient, examId: s
     });
 }
 
+function computeSectionExamResults(tx: Prisma.TransactionClient, examId: string, sectionId: string) {
+  return resolveActiveRoster(tx, sectionId).then((students) =>
+    computeExamResultsForRoster(tx, examId, sectionId, students),
+  );
+}
+
+function computeHistoricalSectionExamResults(
+  tx: Prisma.TransactionClient,
+  examId: string,
+  sectionId: string,
+  academicYearId: string,
+) {
+  return resolveHistoricalRoster(tx, sectionId, academicYearId).then((students) =>
+    computeExamResultsForRoster(tx, examId, sectionId, students),
+  );
+}
+
 /**
  * Powers the admin's "Generate Result" flow: pick a Class + Section and
  * get every student's ranked result inline (see computeSectionExamResults)
  * instead of the old zip-of-PDFs-only path (still available below via
  * report-card-batches, for when a printable set is actually needed).
+ *
+ * `?historical=true` switches the roster to Enrollment-based resolution
+ * (computeHistoricalSectionExamResults) instead of "whoever's currently
+ * active in this section" — see resolveHistoricalRoster's own comment.
+ * Default (unset) behavior is byte-for-byte unchanged: every existing
+ * caller (this same live flow, report cards) is unaffected. Only Previous
+ * Data → Results (previousData.ts's frontend counterpart) passes it.
  */
 examsRouter.get('/:examId/results', requireRole(...READ_ROLES), async (req: Request, res: Response) => {
   const examId = uuidParam(req, 'examId');
-  const { sectionId } = req.query as Record<string, string | undefined>;
+  const { sectionId, historical } = req.query as Record<string, string | undefined>;
   if (!sectionId) throw AppError.badRequest('sectionId is required');
 
   const rows = await runWithTenant(req.auth!.tenantId, async (tx) => {
     const exam = await tx.exam.findUnique({ where: { id: examId } });
     if (!exam) throw AppError.notFound('Exam not found');
+    if (historical === 'true') {
+      return computeHistoricalSectionExamResults(tx, examId, sectionId, exam.academicYearId);
+    }
     return computeSectionExamResults(tx, examId, sectionId);
   });
 

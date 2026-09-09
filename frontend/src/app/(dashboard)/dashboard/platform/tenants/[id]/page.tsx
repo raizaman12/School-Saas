@@ -50,6 +50,10 @@ function UsageRow({
 export default function PlatformTenantDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const { data: tenant, isLoading, error, refetch } = useAsync(() => platformApi.getTenant(id), [id]);
+  // Super Admin's full catalog (including deactivated plans) — a tenant already
+  // on a deactivated plan still needs it to show up here, and this admin should
+  // still be able to move a school onto or off of a since-deactivated tier.
+  const { data: plans } = useAsync(() => platformApi.listPlans(), []);
 
   const [planChangeError, setPlanChangeError] = useState<string | null>(null);
 
@@ -84,8 +88,8 @@ export default function PlatformTenantDetailPage({ params }: { params: Promise<{
 
       {(!tenant.limits.withinStudentLimit || !tenant.limits.withinStaffLimit) && (
         <Alert tone="warning" title="Over plan limit">
-          This school has exceeded its {tenant.planDefinition.name} plan limits. New student or staff creation is
-          blocked until they upgrade or you raise their plan.
+          This school has exceeded its {tenant.planDefinition?.name ?? tenant.plan} plan limits. New student or staff
+          creation is blocked until they upgrade or you raise their plan.
         </Alert>
       )}
 
@@ -98,19 +102,19 @@ export default function PlatformTenantDetailPage({ params }: { params: Promise<{
             <UsageRow
               label="Active students"
               used={tenant.usage.studentCount}
-              limit={tenant.planDefinition.maxStudents}
+              limit={tenant.planDefinition?.maxStudents ?? null}
               withinLimit={tenant.limits.withinStudentLimit}
             />
             <UsageRow
               label="Active staff"
               used={tenant.usage.staffCount}
-              limit={tenant.planDefinition.maxStaff}
+              limit={tenant.planDefinition?.maxStaff ?? null}
               withinLimit={tenant.limits.withinStaffLimit}
             />
             <UsageRow
               label="SMS/WhatsApp sends this month"
               used={tenant.usage.smsCreditsUsedThisMonth}
-              limit={tenant.planDefinition.maxSmsCreditsPerMonth}
+              limit={tenant.planDefinition?.maxSmsCreditsPerMonth ?? null}
               withinLimit={tenant.limits.withinSmsLimit}
             />
             <div className="flex items-center justify-between pt-2 text-sm">
@@ -131,13 +135,23 @@ export default function PlatformTenantDetailPage({ params }: { params: Promise<{
               value={tenant.plan}
               onChange={(e) => onPlanChange(e.target.value as TenantPlan)}
             >
-              <option value="TRIAL">Trial</option>
-              <option value="BASIC">Basic</option>
-              <option value="STANDARD">Standard</option>
-              <option value="PREMIUM">Premium</option>
+              {/* Always include the tenant's current plan even if it's since been
+                  deactivated (or, in a stale-data edge case, deleted) — otherwise
+                  the select would silently jump to whichever option is first. */}
+              {!plans?.some((p) => p.code === tenant.plan) && (
+                <option value={tenant.plan}>{tenant.planDefinition?.name ?? tenant.plan}</option>
+              )}
+              {plans?.map((p) => (
+                <option key={p.id} value={p.code}>
+                  {p.name}
+                  {!p.active ? " (deactivated)" : ""}
+                </option>
+              ))}
             </Select>
             <p className="text-xs text-slate-500">
-              Rs {tenant.planDefinition.priceMonthlyPKR.toLocaleString()}/mo — {tenant.planDefinition.features.join(", ")}
+              {tenant.planDefinition
+                ? `Rs ${tenant.planDefinition.priceMonthlyPKR.toLocaleString()}/mo — ${tenant.planDefinition.features.join(", ")}`
+                : "This plan's details are no longer available."}
             </p>
 
             <div className="border-t border-slate-100 pt-4">

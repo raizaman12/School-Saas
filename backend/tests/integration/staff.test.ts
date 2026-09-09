@@ -690,20 +690,37 @@ describe('GET/PATCH /api/staff/me — self-service staff profile', () => {
 });
 
 describe('DELETE /api/staff/:id', () => {
-  it('SCHOOL_ADMIN permanently deletes a staff member with no history — their login stops working', async () => {
+  it('SCHOOL_ADMIN archives a staff member — their record stays intact but their login stops working', async () => {
     const { accessToken, tenant } = await signupSchool(app);
     const created = await request(app).post('/api/staff').set(authHeader(accessToken)).send(staffPayload());
 
     const del = await request(app).delete(`/api/staff/${created.body.data.id}`).set(authHeader(accessToken));
     expect(del.status).toBe(204);
 
+    // The profile stays fully intact (archived, not gone) — findable
+    // directly by id, and via the list endpoint when TERMINATED is asked for.
     const getAfter = await request(app).get(`/api/staff/${created.body.data.id}`).set(authHeader(accessToken));
-    expect(getAfter.status).toBe(404);
+    expect(getAfter.status).toBe(200);
+    expect(getAfter.body.data.status).toBe('TERMINATED');
+
+    // Unlike Students' new ARCHIVED status, TERMINATED is not hidden from
+    // the default (unfiltered) list — that's the pre-existing convention
+    // this endpoint already had for every status, unchanged by this
+    // feature. status=TERMINATED narrows down to just the archived ones,
+    // same as any other status filter.
+    const listDefault = await request(app).get('/api/staff').set(authHeader(accessToken));
+    expect(listDefault.body.data.map((s: { id: string }) => s.id)).toContain(created.body.data.id);
+    const listTerminated = await request(app).get('/api/staff?status=TERMINATED').set(authHeader(accessToken));
+    expect(listTerminated.body.data.map((s: { id: string }) => s.id)).toContain(created.body.data.id);
 
     const loginAttempt = await request(app)
       .post('/api/auth/login')
       .send({ slug: tenant.slug, email: 'teacher.new@test-school.test', password: created.body.tempPassword });
     expect(loginAttempt.status).toBe(401);
+
+    // Archiving twice is a harmless no-op, not an error.
+    const delAgain = await request(app).delete(`/api/staff/${created.body.data.id}`).set(authHeader(accessToken));
+    expect(delAgain.status).toBe(204);
   });
 
   it('refuses to let a SCHOOL_ADMIN delete their own account (400)', async () => {
@@ -714,7 +731,7 @@ describe('DELETE /api/staff/:id', () => {
     expect(res.status).toBe(400);
   });
 
-  it("refuses to delete a staff member who has filed a discipline record, with a clear message, and leaves the record intact", async () => {
+  it("archiving a staff member who has filed a discipline record succeeds (no cascading delete to guard against) and leaves the record intact", async () => {
     const { accessToken, tenant } = await signupSchool(app);
     const created = await request(app).post('/api/staff').set(authHeader(accessToken)).send(staffPayload());
     const teacherLogin = await request(app)
@@ -762,12 +779,22 @@ describe('DELETE /api/staff/:id', () => {
       });
     expect(discipline.status).toBe(201);
 
+    // Archiving never cascades, so there's nothing left to guard against —
+    // this now succeeds unconditionally, unlike the old hard-delete path.
     const del = await request(app).delete(`/api/staff/${created.body.data.id}`).set(authHeader(accessToken));
-    expect(del.status).toBe(409);
-    expect(del.body.error.message).toContain('discipline');
+    expect(del.status).toBe(204);
 
     const stillThere = await request(app).get(`/api/staff/${created.body.data.id}`).set(authHeader(accessToken));
     expect(stillThere.status).toBe(200);
+    expect(stillThere.body.data.status).toBe('TERMINATED');
+
+    // The discipline record's author reference (recordedByUserId) is still
+    // a valid, readable staff user — nothing was deleted out from under it.
+    const disciplineAfter = await request(app)
+      .get(`/api/discipline-records?studentId=${student.body.data.id}`)
+      .set(authHeader(accessToken));
+    expect(disciplineAfter.status).toBe(200);
+    expect(disciplineAfter.body.data.map((d: { id: string }) => d.id)).toContain(discipline.body.data.id);
   });
 
   it('deleting a second SCHOOL_ADMIN succeeds while the founding admin remains (never hits the last-admin guard)', async () => {

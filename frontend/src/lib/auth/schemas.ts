@@ -40,13 +40,6 @@ export const platformLoginSchema = z.object({
 });
 export type PlatformLoginFormValues = z.infer<typeof platformLoginSchema>;
 
-export const PLAN_OPTIONS = [
-  { value: "TRIAL", label: "Trial — free for 14 days" },
-  { value: "BASIC", label: "Basic — Rs 5,000/mo" },
-  { value: "STANDARD", label: "Standard — Rs 12,000/mo" },
-  { value: "PREMIUM", label: "Premium — Rs 25,000/mo" },
-] as const;
-
 export const signupSchema = z.object({
   schoolName: z.string().min(2).max(150),
   slug: slugSchema,
@@ -57,8 +50,11 @@ export const signupSchema = z.object({
   // rather than a registered input (there's no <input name="plan">) — RHF
   // still carries defaultValues through validation for unregistered
   // fields, and the submit handler also merges the selected plan in
-  // explicitly as a second safety net (see onSubmit below).
-  plan: z.enum(['TRIAL', 'BASIC', 'STANDARD', 'PREMIUM']),
+  // explicitly as a second safety net (see onSubmit below). Plans are now a
+  // Super Admin-editable DB table (see resources/tenant.ts's listPlans),
+  // so any non-empty code is accepted here — the backend is the source of
+  // truth for whether it actually exists and is active.
+  plan: z.string().min(1, "Select a plan"),
   // Same pattern as `plan` above, but for the theme-picker wizard step —
   // not validated against a fixed id list here (that catalog is fetched
   // from the backend, see lib/theme), the backend rejects an unknown id.

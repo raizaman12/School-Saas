@@ -40,12 +40,19 @@ export default function PlatformOverviewPage() {
             <CardTitle>Schools by plan</CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
-            {(["TRIAL", "BASIC", "STANDARD", "PREMIUM"] as const).map((plan) => (
-              <div key={plan} className="flex items-center justify-between text-sm">
-                <span className="text-slate-500">{plan}</span>
-                <span className="font-medium text-slate-900">{stats.byPlan[plan] ?? 0}</span>
-              </div>
-            ))}
+            {/* Derived from whatever plan codes actually appear on a tenant
+                today — plans are now a Super Admin-editable table, so a
+                hardcoded TRIAL/BASIC/STANDARD/PREMIUM list here would quietly
+                hide the count for any newly added plan. */}
+            {Object.keys(stats.byPlan).length === 0 && <p className="text-sm text-slate-500">No schools yet.</p>}
+            {Object.entries(stats.byPlan)
+              .sort(([, a], [, b]) => b - a)
+              .map(([plan, count]) => (
+                <div key={plan} className="flex items-center justify-between text-sm">
+                  <span className="text-slate-500">{plan}</span>
+                  <span className="font-medium text-slate-900">{count}</span>
+                </div>
+              ))}
           </CardContent>
         </Card>
 
