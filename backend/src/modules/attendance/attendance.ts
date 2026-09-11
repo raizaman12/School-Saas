@@ -7,6 +7,7 @@ import { runWithTenant } from '../../lib/tenantContext';
 import { AppError } from '../../utils/AppError';
 import { uuidParam } from '../../utils/params';
 import { teacherSectionIds } from '../../lib/teacherScope';
+import { dispatchNotification } from '../notifications/notificationService';
 import { renderAttendanceReportPdf } from './attendanceReportPdf';
 import { isNonWorkingDay } from './holidays';
 import {
@@ -177,6 +178,65 @@ async function assertLectureAttendanceWindowOpen(
   }
 }
 
+function isTodayUtc(date: Date): boolean {
+  const todayUtc = new Date();
+  todayUtc.setUTCHours(0, 0, 0, 0);
+  return date.getTime() === todayUtc.getTime();
+}
+
+/**
+ * Fires one WhatsApp message per guardian linked to the student, for a
+ * single lecture's PRESENT/ABSENT mark — see the POST / handler's call
+ * site for the exact scoping this is only ever called under (one specific
+ * lecture, today only, PRESENT/ABSENT only, a genuinely new-or-changed
+ * mark). Every guardian dispatch is wrapped in try/catch: a failed or
+ * quota-exceeded send is already recorded as a FAILED Notification row by
+ * dispatchNotification itself rather than thrown (see
+ * notifications/notificationService.ts) — this extra guard just makes sure
+ * an unexpected error from the notification side can never fail the
+ * attendance mark itself, same as notifications.ts's existing broadcast
+ * handler.
+ */
+async function notifyGuardiansOfAttendance(
+  tx: Prisma.TransactionClient,
+  tenantId: string,
+  params: {
+    studentId: string;
+    studentFullName: string;
+    sectionSubjectId: string;
+    status: 'PRESENT' | 'ABSENT';
+    date: Date;
+    createdByUserId: string;
+  },
+) {
+  const [guardianLinks, sectionSubject] = await Promise.all([
+    tx.studentGuardian.findMany({ where: { studentId: params.studentId }, include: { guardian: true } }),
+    tx.sectionSubject.findUnique({ where: { id: params.sectionSubjectId }, include: { subject: true } }),
+  ]);
+
+  const subjectName = sectionSubject?.subject.name ?? 'class';
+  const dateLabel = params.date.toISOString().slice(0, 10);
+  const body =
+    params.status === 'PRESENT'
+      ? `Dear Parent, your child ${params.studentFullName} was marked PRESENT in ${subjectName} today (${dateLabel}).`
+      : `Dear Parent, your child ${params.studentFullName} was marked ABSENT in ${subjectName} today (${dateLabel}). Please contact the school if this is unexpected.`;
+
+  for (const link of guardianLinks) {
+    try {
+      await dispatchNotification(tx, tenantId, {
+        channel: 'WHATSAPP',
+        recipientPhone: link.guardian.phone,
+        body,
+        relatedEntityType: 'Student',
+        relatedEntityId: params.studentId,
+        createdByUserId: params.createdByUserId,
+      });
+    } catch {
+      // Swallowed deliberately — see this function's doc comment.
+    }
+  }
+}
+
 /** Bulk mark (or re-mark) attendance for a whole section on one date. */
 attendanceRouter.post('/', requireRole(...WRITE_ROLES), async (req: Request, res: Response) => {
   const input = markAttendanceSchema.parse(req.body);
@@ -205,6 +265,8 @@ attendanceRouter.post('/', requireRole(...WRITE_ROLES), async (req: Request, res
       throw AppError.badRequest('Some students are not currently enrolled in this section', { invalid });
     }
 
+    const studentById = new Map(students.map((s) => [s.id, s]));
+
     // Fetched up front (not inside the loop) so each existing status is
     // known before any upsert runs — needed to tell an actual *edit*
     // (status changing on an already-marked day) apart from an initial
@@ -212,8 +274,19 @@ attendanceRouter.post('/', requireRole(...WRITE_ROLES), async (req: Request, res
     // someone was first marked ABSENT and later corrected to PRESENT is
     // useful; logging every single initial mark for a 300-student class
     // roster every single day is just noise.
+    //
+    // Scoped by sectionSubjectId (this exact lecture, or the whole-day
+    // mark when none is given) — a student can now have more than one row
+    // per day, one per lecture (see schema.prisma's AttendanceRecord doc
+    // comment), so without this scoping a student's *other* lecture's row
+    // for today could be mistaken for "the prior state" of this one.
     const existing = await tx.attendanceRecord.findMany({
-      where: { sectionId: input.sectionId, date: input.date, studentId: { in: studentIds } },
+      where: {
+        sectionId: input.sectionId,
+        date: input.date,
+        studentId: { in: studentIds },
+        sectionSubjectId: input.sectionSubjectId ?? null,
+      },
     });
     const existingByStudent = new Map(existing.map((r) => [r.studentId, r]));
 
@@ -221,30 +294,100 @@ attendanceRouter.post('/', requireRole(...WRITE_ROLES), async (req: Request, res
     const edits: Array<{ studentId: string; fromStatus: string; toStatus: string }> = [];
     for (const r of input.records) {
       const prior = existingByStudent.get(r.studentId);
+      const isNewOrChanged = !prior || prior.status !== r.status;
       if (prior && prior.status !== r.status) {
         edits.push({ studentId: r.studentId, fromStatus: prior.status, toStatus: r.status });
       }
 
-      const record = await tx.attendanceRecord.upsert({
-        where: { studentId_date: { studentId: r.studentId, date: input.date } },
-        update: {
-          status: r.status,
-          remarks: r.remarks,
-          sectionId: input.sectionId,
-          markedByUserId: auth.userId,
-        },
-        create: {
-          id: randomUUID(),
-          tenantId,
-          studentId: r.studentId,
-          sectionId: input.sectionId,
-          date: input.date,
-          status: r.status,
-          remarks: r.remarks,
-          markedByUserId: auth.userId,
-        },
-      });
+      let record;
+      if (input.sectionSubjectId) {
+        // One specific lecture — upserts against the new composite key, so
+        // this student's other lectures' rows for today are untouched.
+        record = await tx.attendanceRecord.upsert({
+          where: {
+            studentId_date_sectionSubjectId: {
+              studentId: r.studentId,
+              date: input.date,
+              sectionSubjectId: input.sectionSubjectId,
+            },
+          },
+          update: {
+            status: r.status,
+            remarks: r.remarks,
+            sectionId: input.sectionId,
+            markedByUserId: auth.userId,
+          },
+          create: {
+            id: randomUUID(),
+            tenantId,
+            studentId: r.studentId,
+            sectionId: input.sectionId,
+            sectionSubjectId: input.sectionSubjectId,
+            date: input.date,
+            status: r.status,
+            remarks: r.remarks,
+            markedByUserId: auth.userId,
+          },
+        });
+      } else {
+        // No specific lecture (the general Attendance page's whole-day
+        // flow) — same "one row per student per day" behavior this always
+        // had, just resolved by hand: a partial unique index (guarding
+        // this exact case at the DB level — see the migration) isn't
+        // something Prisma's typed upsert can target through a compound
+        // key with a null segment.
+        if (prior) {
+          record = await tx.attendanceRecord.update({
+            where: { id: prior.id },
+            data: { status: r.status, remarks: r.remarks, sectionId: input.sectionId, markedByUserId: auth.userId },
+          });
+        } else {
+          try {
+            record = await tx.attendanceRecord.create({
+              data: {
+                id: randomUUID(),
+                tenantId,
+                studentId: r.studentId,
+                sectionId: input.sectionId,
+                date: input.date,
+                status: r.status,
+                remarks: r.remarks,
+                markedByUserId: auth.userId,
+              },
+            });
+          } catch {
+            // Unique-violation race on the partial index (two concurrent
+            // whole-day marks for the same student+date) — surface a clean
+            // conflict instead of a raw DB error.
+            throw AppError.conflict(
+              "This student's attendance for this date was just marked by someone else — refresh and try again.",
+            );
+          }
+        }
+      }
       records.push(record);
+
+      // Per-lecture WhatsApp notification to guardians — deliberately
+      // narrow: only a real single-lecture mark (never the general
+      // Attendance page's whole-day flow), only for today (backfilling a
+      // past lecture shouldn't spam a message), only PRESENT/ABSENT (not
+      // LATE/LEAVE/HALF_DAY/EARLY_LEAVE), and only when this mark is new or
+      // actually changed status (re-saving the same status never re-sends).
+      if (
+        input.sectionSubjectId &&
+        isNewOrChanged &&
+        (r.status === 'PRESENT' || r.status === 'ABSENT') &&
+        isTodayUtc(input.date)
+      ) {
+        await notifyGuardiansOfAttendance(tx, tenantId, {
+          studentId: r.studentId,
+          studentFullName: studentById.get(r.studentId)?.fullName ?? 'your child',
+          sectionSubjectId: input.sectionSubjectId,
+          status: r.status,
+          date: input.date,
+          createdByUserId: auth.userId,
+        });
+      }
     }
 
     if (edits.length > 0) {
@@ -288,7 +431,15 @@ attendanceRouter.get('/', requireRole(...READ_ROLES), async (req: Request, res: 
         where: { currentSectionId: query.sectionId, status: 'ACTIVE' },
         orderBy: { fullName: 'asc' },
       }),
-      tx.attendanceRecord.findMany({ where: { sectionId: query.sectionId, date: query.date } }),
+      // Scoped to the whole-day mark (sectionSubjectId: null) — this is
+      // the general Attendance page, which has always shown one status per
+      // student for the day; a student can now also have separate
+      // per-lecture rows (see schema.prisma's AttendanceRecord doc
+      // comment), but those belong to the course page's own per-lecture
+      // view, not this whole-section roster.
+      tx.attendanceRecord.findMany({
+        where: { sectionId: query.sectionId, date: query.date, sectionSubjectId: null },
+      }),
     ]);
 
     const byStudent = new Map(records.map((r) => [r.studentId, r]));

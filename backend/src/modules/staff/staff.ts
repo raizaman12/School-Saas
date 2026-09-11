@@ -6,6 +6,8 @@ import { requireAuth, requireRole } from '../../middleware/auth';
 import { runWithTenant } from '../../lib/tenantContext';
 import { hashPassword } from '../../lib/password';
 import { assertCanAddStaff } from '../../lib/planLimits';
+import { dispatchNotification } from '../notifications/notificationService';
+import { credentialsEmailBody, credentialsSmsBody, ROLE_LABELS } from '../portal/provisioning';
 import { AppError } from '../../utils/AppError';
 import { uuidParam } from '../../utils/params';
 import { paginationMeta, toSkipTake } from '../../utils/pagination';
@@ -322,6 +324,56 @@ staffRouter.post('/', requireRole(...WRITE_ROLES), async (req: Request, res: Res
         entityId: staffProfile.id,
       },
     });
+
+    // Email + SMS the credentials, same independent-legs pattern as
+    // guardian/student login creation (see portal/provisioning.ts's
+    // credentialsEmailBody/credentialsSmsBody, reused here rather than
+    // duplicated) — a staff member no longer has to wait for the admin to
+    // relay this out-of-band. Only fires for whichever address is on file;
+    // an ID-only account (input.email absent) still works to log in, the
+    // admin just has to hand over the ID + temp password directly.
+    if (input.email || input.phone) {
+      const tenant = await tx.tenant.findUnique({ where: { id: tenantId }, select: { name: true, slug: true } });
+      const roleLabel = ROLE_LABELS[input.role] ?? 'staff';
+
+      if (input.email) {
+        await dispatchNotification(tx, tenantId, {
+          channel: 'EMAIL',
+          recipientUserId: user.id,
+          recipientEmail: input.email,
+          trustedRecipient: true,
+          subject: `Your ${tenant?.name ?? 'school'} ${roleLabel} portal login`,
+          body: credentialsEmailBody({
+            tenantName: tenant?.name ?? 'your school',
+            slug: tenant?.slug ?? '',
+            email: input.email,
+            tempPassword,
+            roleLabel,
+          }),
+          relatedEntityType: 'StaffProfile',
+          relatedEntityId: staffProfile.id,
+          createdByUserId: req.auth!.userId,
+        });
+      }
+
+      if (input.phone) {
+        await dispatchNotification(tx, tenantId, {
+          channel: 'SMS',
+          recipientUserId: user.id,
+          recipientPhone: input.phone,
+          trustedRecipient: true,
+          body: credentialsSmsBody({
+            tenantName: tenant?.name ?? 'your school',
+            loginIdOrEmail: input.email ?? loginId ?? '(ask the admin)',
+            tempPassword,
+            roleLabel,
+          }),
+          relatedEntityType: 'StaffProfile',
+          relatedEntityId: staffProfile.id,
+          createdByUserId: req.auth!.userId,
+        });
+      }
+    }
 
     return staffProfile;
   });

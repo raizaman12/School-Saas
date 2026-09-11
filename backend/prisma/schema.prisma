@@ -780,6 +780,7 @@ model SectionSubject {
   electiveEnrollments StudentElectiveEnrollment[]
   courseMaterials     CourseMaterial[]
   classTests          ClassTest[]
+  attendanceRecords   AttendanceRecord[]
 
   @@unique([sectionId, subjectId])
   @@index([tenantId])
@@ -890,13 +891,32 @@ model AttendanceRecord {
   status  AttendanceStatus
   remarks String?
 
+  // Which specific lecture this mark is for — set by the teacher "quick
+  // mark from course page" flow (see attendance.ts's
+  // assertLectureAttendanceWindowOpen), left null by the general Attendance
+  // page's whole-section/whole-day flow. Nullable + SetNull-on-delete so
+  // retiring a subject-section mapping later never deletes attendance
+  // history, only detaches which lecture a past record was for — same
+  // "never destroy history" principle as student/staff archiving.
+  sectionSubjectId String?         @db.Uuid
+  sectionSubject   SectionSubject? @relation(fields: [sectionSubjectId], references: [id], onDelete: SetNull)
+
   markedByUserId String? @db.Uuid
   markedBy       User?   @relation("AttendanceMarkedBy", fields: [markedByUserId], references: [id], onDelete: SetNull)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([studentId, date])
+  // Composite unique — enforces "one row per student per date per specific
+  // lecture." This alone does NOT stop duplicate whole-day (null
+  // sectionSubjectId) rows for the same student+date, since Postgres
+  // treats each NULL in a plain unique constraint as distinct from every
+  // other NULL — the migration's hand-written partial unique index
+  // (`attendance_records_student_date_whole_day_key`, WHERE
+  // section_subject_id IS NULL) is what actually guards that case, same as
+  // this project's RLS policies are hand-written rather than expressed in
+  // this schema file.
+  @@unique([studentId, date, sectionSubjectId])
   @@index([tenantId])
   @@index([tenantId, sectionId, date])
   @@map("attendance_records")

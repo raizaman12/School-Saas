@@ -26,7 +26,7 @@ function generateTempPassword(): string {
  * HTML templating exists anywhere else in this codebase yet). Mentions the
  * tenant's slug since logging in also requires picking the right school.
  */
-function credentialsEmailBody(params: {
+export function credentialsEmailBody(params: {
   tenantName: string;
   slug: string;
   email: string;
@@ -42,6 +42,23 @@ function credentialsEmailBody(params: {
     '',
     'Please log in and change your password as soon as possible. Your login email stays the same even after you change your password.',
   ].join('\n');
+}
+
+/**
+ * SMS companion to credentialsEmailBody() above — same information, kept to
+ * one short line since SMS is priced/split per ~160-character segment
+ * (unlike email, where length is free). Sent as a *second*, independent
+ * dispatch alongside the email at every call site below — losing the SMS
+ * leg (e.g. no real Twilio credentials yet, or the recipient has no phone
+ * on file) never blocks or is blocked by the email leg.
+ */
+export function credentialsSmsBody(params: {
+  tenantName: string;
+  loginIdOrEmail: string;
+  tempPassword: string;
+  roleLabel: string;
+}): string {
+  return `${params.tenantName}: your ${params.roleLabel} login is ${params.loginIdOrEmail}, temp password ${params.tempPassword}. Please log in and change it soon.`;
 }
 
 /**
@@ -113,6 +130,27 @@ export async function createGuardianLogin(
     createdByUserId: opts.createdByUserId,
   });
 
+  // Guardian.phone is a required field (never null) — unlike email, this
+  // leg never needs a presence guard. A failed/quota-exceeded SMS send is
+  // recorded as a FAILED Notification row by dispatchNotification itself
+  // and never throws, so it can't undo the login/email work already done
+  // above.
+  await dispatchNotification(tx, tenantId, {
+    channel: 'SMS',
+    recipientUserId: user.id,
+    recipientPhone: guardian.phone,
+    trustedRecipient: true,
+    body: credentialsSmsBody({
+      tenantName: tenant?.name ?? 'your school',
+      loginIdOrEmail: email,
+      tempPassword,
+      roleLabel: 'parent',
+    }),
+    relatedEntityType: 'Guardian',
+    relatedEntityId: guardian.id,
+    createdByUserId: opts.createdByUserId,
+  });
+
   // `email` (not `user.email`) — same value, but typed as the guaranteed
   // string it is here (guardians stay email-only; User.email is nullable
   // now only for the ID-only staff/student logins elsewhere).
@@ -169,33 +207,108 @@ export async function createStudentLogin(
     data: { userId: user.id },
   });
 
-  // Only when there's actually an address to send to — a student admitted
-  // without an email still gets their login (the ID branch above), they
-  // just have to be told the credentials out-of-band (same "admin relays
-  // it" pattern staff creation already uses, see staff.ts).
-  if (opts.email) {
+  // Email and SMS legs are independent — an admission with an email but no
+  // contact phone (or vice versa) still gets whichever address it has; a
+  // student admitted with neither just gets their ID-based login (above)
+  // and the admin relays it out-of-band, same as staff creation does.
+  if (opts.email || student.contactPhone) {
     const tenant = await tx.tenant.findUnique({ where: { id: tenantId }, select: { name: true, slug: true } });
 
-    await dispatchNotification(tx, tenantId, {
-      channel: 'EMAIL',
-      recipientUserId: user.id,
-      recipientEmail: opts.email,
-      trustedRecipient: true,
-      subject: `Your ${tenant?.name ?? 'school'} student portal login`,
-      body: credentialsEmailBody({
-        tenantName: tenant?.name ?? 'your school',
-        slug: tenant?.slug ?? '',
-        email: opts.email,
-        tempPassword,
-        roleLabel: 'student',
-      }),
-      relatedEntityType: 'Student',
-      relatedEntityId: student.id,
-      createdByUserId: opts.createdByUserId,
-    });
+    if (opts.email) {
+      await dispatchNotification(tx, tenantId, {
+        channel: 'EMAIL',
+        recipientUserId: user.id,
+        recipientEmail: opts.email,
+        trustedRecipient: true,
+        subject: `Your ${tenant?.name ?? 'school'} student portal login`,
+        body: credentialsEmailBody({
+          tenantName: tenant?.name ?? 'your school',
+          slug: tenant?.slug ?? '',
+          email: opts.email,
+          tempPassword,
+          roleLabel: 'student',
+        }),
+        relatedEntityType: 'Student',
+        relatedEntityId: student.id,
+        createdByUserId: opts.createdByUserId,
+      });
+    }
+
+    // student.contactPhone is the family contact number captured at
+    // admission (see sis/students.ts's CreateStudentRecordInput) — there's
+    // no separate student-only phone field, so this is the right SMS
+    // target for a young student's login credentials.
+    if (student.contactPhone) {
+      await dispatchNotification(tx, tenantId, {
+        channel: 'SMS',
+        recipientUserId: user.id,
+        recipientPhone: student.contactPhone,
+        trustedRecipient: true,
+        body: credentialsSmsBody({
+          tenantName: tenant?.name ?? 'your school',
+          loginIdOrEmail: opts.email ?? loginId,
+          tempPassword,
+          roleLabel: 'student',
+        }),
+        relatedEntityType: 'Student',
+        relatedEntityId: student.id,
+        createdByUserId: opts.createdByUserId,
+      });
+    }
   }
 
   return { student: updatedStudent, userId: user.id, email: user.email, loginId, tempPassword };
+}
+
+/**
+ * Notifies a guardian, right when they're linked to a student, that a
+ * portal login already exists for that student — called from
+ * sis/guardians.ts both when a new guardian is created with a studentId
+ * and when an existing guardian is linked to a second/third child via
+ * POST /link/:studentId. Deliberately does NOT include (or reset) the
+ * password: the student may already be actively using it, and silently
+ * changing it just because another guardian was added would be a
+ * surprising side effect. A no-op when the student has no login yet —
+ * createStudentLogin (student creation) or a manual "create login" already
+ * covers that path, and there's nothing to tell this guardian yet.
+ */
+export async function notifyGuardianOfExistingStudentLogin(
+  tx: Prisma.TransactionClient,
+  tenantId: string,
+  params: { studentId: string; guardian: Guardian; createdByUserId?: string },
+) {
+  const student = await tx.student.findUnique({ where: { id: params.studentId } });
+  if (!student?.userId) return;
+
+  const studentUser = await tx.user.findUnique({ where: { id: student.userId } });
+  if (!studentUser) return;
+
+  const tenant = await tx.tenant.findUnique({ where: { id: tenantId }, select: { name: true, slug: true } });
+  const loginIdOrEmail = studentUser.email ?? studentUser.loginId ?? '(ask the school admin for the login ID)';
+  const body = `${tenant?.name ?? 'Your school'}: ${student.fullName} already has a student portal login — ID: ${loginIdOrEmail}. Contact the school admin, or use "Forgot password" on the login page, if you need the password reset.`;
+
+  if (params.guardian.email) {
+    await dispatchNotification(tx, tenantId, {
+      channel: 'EMAIL',
+      recipientEmail: params.guardian.email,
+      subject: `${student.fullName}'s student portal login`,
+      body,
+      relatedEntityType: 'Student',
+      relatedEntityId: student.id,
+      createdByUserId: params.createdByUserId,
+    });
+  }
+
+  // Guardian.phone is required (never null) — same as the credentials-SMS
+  // legs above, no presence guard needed.
+  await dispatchNotification(tx, tenantId, {
+    channel: 'SMS',
+    recipientPhone: params.guardian.phone,
+    body,
+    relatedEntityType: 'Student',
+    relatedEntityId: student.id,
+    createdByUserId: params.createdByUserId,
+  });
 }
 
 portalProvisioningRouter.post(
@@ -242,7 +355,7 @@ portalProvisioningRouter.post(
   },
 );
 
-const ROLE_LABELS: Record<string, string> = {
+export const ROLE_LABELS: Record<string, string> = {
   SCHOOL_ADMIN: 'admin',
   PRINCIPAL: 'principal',
   TEACHER: 'teacher',
@@ -290,30 +403,51 @@ portalProvisioningRouter.post(
         data: { revokedAt: new Date() },
       });
 
-      // Only when there's actually an email on file — an ID-only login
-      // (see createStudentLogin/staff.ts's doc comments) has nowhere to
-      // send this; the admin relays the temp password from the response
-      // below instead, same out-of-band pattern used at creation time.
-      if (user.email) {
+      // Only when there's an address on file — an ID-only login (see
+      // createStudentLogin/staff.ts's doc comments) has nowhere to send
+      // this; the admin relays the temp password from the response below
+      // instead, same out-of-band pattern used at creation time. Email and
+      // SMS legs are independent, same as at creation.
+      if (user.email || user.phone) {
         const tenant = await tx.tenant.findUnique({ where: { id: tenantId }, select: { name: true, slug: true } });
 
-        await dispatchNotification(tx, tenantId, {
-          channel: 'EMAIL',
-          recipientUserId: userId,
-          recipientEmail: user.email,
-          trustedRecipient: true,
-          subject: `Your ${tenant?.name ?? 'school'} portal password has been reset`,
-          body: credentialsEmailBody({
-            tenantName: tenant?.name ?? 'your school',
-            slug: tenant?.slug ?? '',
-            email: user.email,
-            tempPassword,
-            roleLabel: ROLE_LABELS[user.role] ?? 'portal',
-          }),
-          relatedEntityType: 'User',
-          relatedEntityId: userId,
-          createdByUserId: req.auth!.userId,
-        });
+        if (user.email) {
+          await dispatchNotification(tx, tenantId, {
+            channel: 'EMAIL',
+            recipientUserId: userId,
+            recipientEmail: user.email,
+            trustedRecipient: true,
+            subject: `Your ${tenant?.name ?? 'school'} portal password has been reset`,
+            body: credentialsEmailBody({
+              tenantName: tenant?.name ?? 'your school',
+              slug: tenant?.slug ?? '',
+              email: user.email,
+              tempPassword,
+              roleLabel: ROLE_LABELS[user.role] ?? 'portal',
+            }),
+            relatedEntityType: 'User',
+            relatedEntityId: userId,
+            createdByUserId: req.auth!.userId,
+          });
+        }
+
+        if (user.phone) {
+          await dispatchNotification(tx, tenantId, {
+            channel: 'SMS',
+            recipientUserId: userId,
+            recipientPhone: user.phone,
+            trustedRecipient: true,
+            body: credentialsSmsBody({
+              tenantName: tenant?.name ?? 'your school',
+              loginIdOrEmail: user.email ?? user.loginId ?? user.phone,
+              tempPassword,
+              roleLabel: ROLE_LABELS[user.role] ?? 'portal',
+            }),
+            relatedEntityType: 'User',
+            relatedEntityId: userId,
+            createdByUserId: req.auth!.userId,
+          });
+        }
       }
 
       return { email: user.email, tempPassword };

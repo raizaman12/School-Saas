@@ -17,6 +17,7 @@ import { DEFAULT_GRADE_BANDS } from '../exams/grading';
 import { deriveTenantCode } from '../../utils/tenantCode';
 import { slugify } from '../../utils/slugify';
 import { dispatchNotification } from '../notifications/notificationService';
+import { ROLE_LABELS } from '../portal/provisioning';
 import { looksLikeEmail, normalizeLoginId } from '../../lib/loginId';
 import type {
   SignupInput,
@@ -925,7 +926,10 @@ export async function resetPassword(input: ResetPasswordInput, meta: { ipAddress
 
     const newPasswordHash = await hashPassword(input.newPassword);
 
-    await tx.user.update({ where: { id: stored.userId }, data: { passwordHash: newPasswordHash } });
+    const user = await tx.user.update({
+      where: { id: stored.userId },
+      data: { passwordHash: newPasswordHash },
+    });
     await tx.passwordResetToken.update({ where: { id: stored.id }, data: { usedAt: new Date() } });
     await tx.refreshToken.updateMany({
       where: { userId: stored.userId, revokedAt: null },
@@ -942,6 +946,40 @@ export async function resetPassword(input: ResetPasswordInput, meta: { ipAddress
         ipAddress: meta.ipAddress,
       },
     });
+
+    // Security-notice confirmation, separate from requestPasswordReset's
+    // own "here's your reset code" email above — this one fires only once
+    // the password has actually been changed, so the account owner finds
+    // out even if they weren't the one who requested it. Deliberately
+    // contains no password/code — just "this happened" — same independent
+    // email+SMS legs as every other credentials dispatch in this app.
+    if (user.email || user.phone) {
+      const body = `Your ${tenant.name} ${ROLE_LABELS[user.role] ?? 'portal'} password was just changed. If this wasn't you, contact the school admin immediately.`;
+
+      if (user.email) {
+        await dispatchNotification(tx, tenant.id, {
+          channel: 'EMAIL',
+          recipientUserId: user.id,
+          recipientEmail: user.email,
+          trustedRecipient: true,
+          subject: `Your ${tenant.name} password was changed`,
+          body,
+          relatedEntityType: 'User',
+          relatedEntityId: user.id,
+        });
+      }
+      if (user.phone) {
+        await dispatchNotification(tx, tenant.id, {
+          channel: 'SMS',
+          recipientUserId: user.id,
+          recipientPhone: user.phone,
+          trustedRecipient: true,
+          body,
+          relatedEntityType: 'User',
+          relatedEntityId: user.id,
+        });
+      }
+    }
   });
 }
 

@@ -7,7 +7,7 @@ import { runWithTenant } from '../../lib/tenantContext';
 import { AppError } from '../../utils/AppError';
 import { uuidParam } from '../../utils/params';
 import { paginationMeta, toSkipTake } from '../../utils/pagination';
-import { createGuardianLogin } from '../portal/provisioning';
+import { createGuardianLogin, notifyGuardianOfExistingStudentLogin } from '../portal/provisioning';
 import { teacherSectionIds } from '../../lib/teacherScope';
 import {
   createGuardianSchema,
@@ -141,6 +141,17 @@ guardiansRouter.post('/', requireRole(...WRITE_ROLES), async (req: Request, res:
           isPrimary: input.isPrimary ?? false,
         },
       });
+
+      // If this student already has a portal login (e.g. admitted earlier
+      // with a contact email/phone, before this guardian existed), let the
+      // new guardian know it exists — see
+      // notifyGuardianOfExistingStudentLogin's own doc comment for why
+      // this deliberately never touches the password itself.
+      await notifyGuardianOfExistingStudentLogin(tx, tenantId, {
+        studentId: input.studentId,
+        guardian: created,
+        createdByUserId: req.auth!.userId,
+      });
     }
 
     // Auto-provision + email a parent portal login when an email was
@@ -272,7 +283,7 @@ guardiansRouter.post(
         });
       }
 
-      return tx.studentGuardian.create({
+      const created = await tx.studentGuardian.create({
         data: {
           id: randomUUID(),
           tenantId,
@@ -281,6 +292,19 @@ guardiansRouter.post(
           isPrimary: input.isPrimary ?? false,
         },
       });
+
+      // Same "let the guardian know a login already exists" notification
+      // as guardian creation above — this route links an *existing*
+      // guardian (e.g. also a sibling's parent) to another student, which
+      // is exactly the other case where a guardian might not yet know a
+      // student portal login is there.
+      await notifyGuardianOfExistingStudentLogin(tx, tenantId, {
+        studentId: uuidParam(req, 'studentId'),
+        guardian,
+        createdByUserId: req.auth!.userId,
+      });
+
+      return created;
     });
 
     res.status(201).json({ data: link });
